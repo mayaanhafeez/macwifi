@@ -1,0 +1,68 @@
+[package]
+name = "macwifi"
+version = "0.1.0"
+edition = "2024"
+description = "macOS port of impala — TUI for managing Wi-Fi"
+license = "GPL-3.0"
+readme = "Readme.md"
+
+[[bin]]
+name = "macwifi"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "cargo"] }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+
+ratatui = "0.30"
+crossterm = { version = "0.29", default-features = false, features = [
+    "event-stream",
+] }
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+tui-input = { version = "0.15", features = [
+    "crossterm",
+], default-features = false }
+futures = "0.3"
+qrcode = "0.14"
+dirs = "6"
+toml = "1"
+
+# CoreWLAN bindings. The objc2 / objc2-core-wlan crates pull in the right
+# framework links automatically. We pin minor versions explicitly so a future
+# breaking release in objc2 doesn't silently change selector signatures.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSArray",
+    "NSData",
+    "NSDictionary",
+    "NSEnumerator",
+    "NSError",
+    "NSObject",
+    "NSSet",
+    "NSString",
+    "NSValue",
+] }
+objc2-core-wlan = { version = "0.3", features = [
+    "CWWiFiClient",
+    "CWInterface",
+    "CWNetwork",
+    "CWChannel",
+] }
+objc2-core-location = { version = "0.3", features = [
+    "CLLocationManager",
+    "CLLocationManagerDelegate",
+] }
+objc2-core-foundation = { version = "0.3", features = ["CFRunLoop"] }
+
+[profile.release]
+strip = true
+lto = "fat"
+codegen-units = 1
+opt-level = 3
