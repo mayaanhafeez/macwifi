@@ -56,6 +56,12 @@ enum Cmd {
     InstallDaemon,
     /// Remove the LaunchAgent and stop the daemon.
     UninstallDaemon,
+    /// Add the daemon to the keychain ACL of every saved Wi-Fi network so
+    /// joins are silent (no per-connect admin prompt). Prompts admin once.
+    PreGrant,
+    /// Internal helper invoked by `pre-grant` after re-execing under sudo.
+    #[command(hide = true)]
+    PreGrantInternal { ssids: Vec<String> },
 }
 
 #[derive(ValueEnum, Clone, Copy)]
@@ -75,6 +81,13 @@ fn main() -> Result<()> {
         }
         Some(Cmd::InstallDaemon) => macwifi::install::install(),
         Some(Cmd::UninstallDaemon) => macwifi::install::uninstall(),
+        Some(Cmd::PreGrant) => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(run_pre_grant())
+        }
+        Some(Cmd::PreGrantInternal { ssids }) => run_pre_grant_internal(ssids),
         Some(c) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -242,10 +255,72 @@ async fn run_cli(cmd: Cmd) -> Result<()> {
             print_terminal_event(&evs);
             Ok(())
         }
-        Cmd::Themes | Cmd::InstallDaemon | Cmd::UninstallDaemon => unreachable!(),
+        Cmd::Themes
+        | Cmd::InstallDaemon
+        | Cmd::UninstallDaemon
+        | Cmd::PreGrant
+        | Cmd::PreGrantInternal { .. } => unreachable!(),
         Cmd::Diagnose => run_diagnose().await,
         // ShareReady never comes from the CLI; placeholder for completeness.
     }
+}
+
+async fn run_pre_grant() -> Result<()> {
+    // macOS prompts admin auth on every System keychain ACL write and
+    // sudo / AuthorizationCreate don't batch the rights — every
+    // SecKeychainItemSetAccess hits SecurityAgent independently. So
+    // automation can't make this a one-prompt flow. The least-bad UX is
+    // to print the SSID list, open Keychain Access at the System keychain,
+    // and tell the user how to drag the daemon onto each item.
+    let evs = cli_one_shot(Request::RefreshPreferred, |e| {
+        matches!(e, Event::PreferredResult(_))
+    })
+    .await?;
+    let ssids = evs
+        .into_iter()
+        .find_map(|ev| match ev {
+            Event::PreferredResult(v) => Some(v),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if ssids.is_empty() {
+        println!("no saved Wi-Fi networks found");
+        return Ok(());
+    }
+    println!("Your saved Wi-Fi networks ({}):", ssids.len());
+    for s in &ssids {
+        println!("  - {s}");
+    }
+    println!();
+    println!("macOS requires admin auth on every System-keychain ACL write");
+    println!("and won't batch them, so do this manually (per SSID you use):");
+    println!();
+    println!("  1. The Keychain Access window will open at the System keychain");
+    println!("  2. Search for the SSID");
+    println!("  3. Double-click → Access Control tab → '+' button");
+    println!("  4. Cmd-Shift-G, paste: /Applications/macwifi.app/Contents/MacOS/macwifi");
+    println!("  5. Add → Save Changes → admin password");
+    println!();
+    println!("You only need to do this for SSIDs you actively use. Press Enter");
+    println!("to open Keychain Access, or Ctrl-C to skip.");
+    let mut buf = String::new();
+    let _ = std::io::stdin().read_line(&mut buf);
+    std::process::Command::new("open")
+        .args([
+            "-a",
+            "Keychain Access",
+            "/Library/Keychains/System.keychain",
+        ])
+        .status()
+        .ok();
+    Ok(())
+}
+
+fn run_pre_grant_internal(_ssids: Vec<String>) -> Result<()> {
+    // Retained as a hidden subcommand only for backwards compatibility with
+    // a possible sudo re-exec from older copies of the binary; not used in
+    // the current flow.
+    anyhow::bail!("pre-grant-internal is no longer used; run `macwifi pre-grant`")
 }
 
 fn is_notice_or_error(ev: &Event) -> bool {
