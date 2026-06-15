@@ -63,9 +63,14 @@ else
     echo "bundled: $APP  (signed: $IDENTITY)"
 fi
 echo
-echo "next steps:"
-echo "  open $APP                                   # one-off launch (no terminal)"
-echo "  $APP/Contents/MacOS/macwifi                 # run with TUI in current terminal"
-echo "  ln -sf $APP/Contents/MacOS/macwifi /usr/local/bin/macwifi"
+echo "next steps (daemon split: TUI talks to a backgrounded daemon over a socket):"
+echo "  1. cp -R \"$APP\" /Applications/"
+echo "  2. /Applications/macwifi.app/Contents/MacOS/macwifi install-daemon"
+echo "  3. ln -sf /Applications/macwifi.app/Contents/MacOS/macwifi /usr/local/bin/macwifi"
 echo
-echo "on first scan, macOS will ask for Location — click Allow."
+echo "Step 2 fires the one-time Location prompt — click Allow. The daemon is"
+echo "loaded via launchctl so its parent is launchd, which is required for"
+echo "CoreWLAN to return un-redacted SSIDs on Sequoia/Tahoe."
+echo
+echo "If you rebuild with a different CODESIGN_IDENTITY the keychain + TCC"
+echo "grants are invalidated; re-run install-daemon to re-bootstrap."

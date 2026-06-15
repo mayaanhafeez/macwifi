@@ -6,13 +6,18 @@
 
 use std::sync::mpsc::{self as std_mpsc, Sender};
 use std::thread;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::corewlan::{WifiClient, WifiInterface};
 use crate::event::{Event, SharePayload};
 use crate::{keychain, networksetup};
 
-#[derive(Debug)]
+/// Operations the worker can be asked to perform. Serializable so the same
+/// type travels over the daemon's unix socket and through the in-process
+/// channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Request {
     RefreshState,
     Scan,
@@ -24,22 +29,25 @@ pub enum Request {
     JoinSaved(String),
     JoinWithPassword { ssid: String, password: String },
     Share { ssid: String, security: ShareSecurity },
+    Diagnose,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ShareSecurity {
     Wpa,
     Wep,
     Nopass,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Associate {
     pub ssid: String,
     pub kind: AssociateKind,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AssociateKind {
     Open,
     Psk(String),
@@ -47,12 +55,15 @@ pub enum AssociateKind {
     Hidden(Option<String>),
 }
 
+/// In-process worker handle. The daemon uses this directly; the client never
+/// constructs one. The `Local`/`Remote` enum that the TUI sees lives in
+/// `app::WifiHandle`.
 #[derive(Clone)]
-pub struct WifiHandle {
+pub struct LocalWifiHandle {
     tx: Sender<Request>,
 }
 
-impl WifiHandle {
+impl LocalWifiHandle {
     pub fn spawn(events: UnboundedSender<Event>) -> Self {
         let (tx, rx) = std_mpsc::channel::<Request>();
         thread::Builder::new()
@@ -64,6 +75,25 @@ impl WifiHandle {
 
     pub fn send(&self, req: Request) {
         let _ = self.tx.send(req);
+    }
+}
+
+/// Front-door handle the TUI and CLI both use. Dispatches to either the
+/// in-process worker (inside the daemon) or the socket-backed remote handle
+/// (in the client). Same `send` API as the old `WifiHandle`, so call sites
+/// in `app.rs` and `handler.rs` don't change.
+#[derive(Clone)]
+pub enum WifiHandle {
+    Local(LocalWifiHandle),
+    Remote(crate::client::RemoteWifiHandle),
+}
+
+impl WifiHandle {
+    pub fn send(&self, req: Request) {
+        match self {
+            WifiHandle::Local(h) => h.send(req),
+            WifiHandle::Remote(h) => h.send(req),
+        }
     }
 }
 
@@ -151,27 +181,27 @@ fn worker_loop(rx: std_mpsc::Receiver<Request>, events: UnboundedSender<Event>) 
                 emit_state(&iface, &events);
             }
             Request::JoinSaved(ssid) => {
-                let name = iface.name();
-                // Read the saved password directly from the System keychain.
-                // First time per SSID this pops:
-                //   (1) keychain access dialog — user must click "Always
-                //       Allow" (not "Allow") to add our app to the item's
-                //       ACL;
-                //   (2) admin auth dialog — modifying the System keychain
-                //       ACL is privileged.
-                // After both, every subsequent JoinSaved for this SSID is
-                // silent for as long as our codesign identity stays stable
-                // (see CODESIGN_IDENTITY in scripts/bundle.sh).
-                match keychain::wifi_password(&ssid) {
-                    Ok(pw) => match networksetup::set_airport_network(&name, &ssid, Some(&pw)) {
-                        Ok(()) => {
-                            let _ = events.send(Event::Notice(format!("connected to {ssid}")));
-                        }
-                        Err(e) => {
-                            let _ = events
-                                .send(Event::Error(format!("join failed: {e}")));
-                        }
-                    },
+                // In the daemon's launchd-spawned Aqua session, CoreWLAN's
+                // `associateToNetwork:password:nil` looks up the saved
+                // credential internally with no UI prompt — much nicer than
+                // reading the System keychain ourselves, which fires the
+                // admin-auth dialog on every connect because there's no
+                // persistent "Always Allow" path for the System keychain.
+                let result = iface.associate_open(&ssid).or_else(|first_err| {
+                    // CoreWLAN couldn't find or use a saved credential.
+                    // Fall back to an explicit keychain read so the user
+                    // gets the legacy auth-and-join flow.
+                    let name = iface.name();
+                    keychain::wifi_password(&ssid)
+                        .and_then(|pw| {
+                            networksetup::set_airport_network(&name, &ssid, Some(&pw))
+                        })
+                        .map_err(|e| anyhow::anyhow!("{first_err}; fallback failed: {e}"))
+                });
+                match result {
+                    Ok(()) => {
+                        let _ = events.send(Event::Notice(format!("connected to {ssid}")));
+                    }
                     Err(e) => {
                         let _ = events.send(Event::JoinSavedFailed {
                             ssid,
@@ -237,8 +267,40 @@ fn worker_loop(rx: std_mpsc::Receiver<Request>, events: UnboundedSender<Event>) 
                 }
                 emit_preferred(&iface, &events);
             }
+            Request::Diagnose => {
+                emit_diagnose(&iface, &events);
+            }
         }
     }
+}
+
+fn emit_diagnose(iface: &WifiInterface, events: &UnboundedSender<Event>) {
+    use crate::event::DaemonDiagnose;
+    let state = iface.state();
+    let scan = iface.scan().unwrap_or_default();
+    let blank = scan
+        .iter()
+        .filter(|n| n.ssid.as_deref().map_or(true, str::is_empty))
+        .count();
+    let location_auth_raw = unsafe {
+        let mgr = objc2_core_location::CLLocationManager::new();
+        mgr.authorizationStatus().0 as i32
+    };
+    let pid = unsafe { libc::getpid() };
+    let parent_pid = unsafe { libc::getppid() };
+    let (interface, current_ssid) = match &state {
+        Ok(s) => (s.name.clone(), s.ssid.clone()),
+        Err(_) => (iface.name(), None),
+    };
+    let _ = events.send(Event::DaemonDiagnose(DaemonDiagnose {
+        pid,
+        parent_pid,
+        location_auth_raw,
+        interface,
+        current_ssid,
+        scan_count: scan.len(),
+        scan_blank: blank,
+    }));
 }
 
 fn emit_state(iface: &WifiInterface, events: &UnboundedSender<Event>) {

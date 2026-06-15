@@ -10,6 +10,7 @@ use anyhow::{Result, anyhow};
 use objc2::rc::Retained;
 use objc2_core_wlan::{CWInterface, CWNetwork, CWSecurity, CWWiFiClient};
 use objc2_foundation::{NSData, NSError, NSString};
+use serde::{Deserialize, Serialize};
 
 pub struct WifiClient {
     client: Retained<CWWiFiClient>,
@@ -19,7 +20,7 @@ pub struct WifiInterface {
     iface: Retained<CWInterface>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScannedNetwork {
     pub ssid: Option<String>,
     pub bssid: Option<String>,
@@ -28,7 +29,7 @@ pub struct ScannedNetwork {
     pub security: Security,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Security {
     Open,
     Wep,
@@ -41,7 +42,7 @@ pub enum Security {
     Unknown,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InterfaceState {
     pub name: String,
     pub powered: bool,

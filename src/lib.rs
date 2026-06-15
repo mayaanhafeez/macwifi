@@ -6,10 +6,14 @@
 // by the Free Software Foundation. See the LICENSE file for the full text.
 
 pub mod app;
+pub mod client;
 pub mod config;
 pub mod corewlan;
+pub mod daemon;
 pub mod event;
 pub mod handler;
+pub mod install;
+pub mod ipc;
 pub mod keychain;
 pub mod location;
 pub mod networksetup;

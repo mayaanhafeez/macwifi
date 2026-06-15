@@ -2,15 +2,15 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use macwifi::app::App;
+use macwifi::client::{RemoteWifiHandle, cli_one_shot};
 use macwifi::config::Config;
-use macwifi::corewlan::{Security, WifiClient};
-use macwifi::event::{Event, EventHandler};
+use macwifi::corewlan::Security;
+use macwifi::event::{Event, UiEvent, UiEventHandler};
 use macwifi::handler;
-use macwifi::networksetup;
 use macwifi::terminal::Tui;
 use macwifi::theme;
 use macwifi::ui;
-use macwifi::worker::WifiHandle;
+use macwifi::worker::{Request, ShareSecurity, WifiHandle};
 
 #[derive(Parser)]
 #[command(version, about = "macOS port of impala — Wi-Fi from the terminal")]
@@ -50,6 +50,12 @@ enum Cmd {
     },
     Themes,
     Diagnose,
+    /// Run the daemon (invoked by the LaunchAgent — not for end users).
+    Daemon,
+    /// Install the LaunchAgent so the daemon starts at login.
+    InstallDaemon,
+    /// Remove the LaunchAgent and stop the daemon.
+    UninstallDaemon,
 }
 
 #[derive(ValueEnum, Clone, Copy)]
@@ -67,7 +73,14 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Some(c) => run_cli(c),
+        Some(Cmd::InstallDaemon) => macwifi::install::install(),
+        Some(Cmd::UninstallDaemon) => macwifi::install::uninstall(),
+        Some(c) => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(run_cli(c))
+        }
         None => {
             let cfg = Config::load().unwrap_or_default();
             let theme_name = cli.theme.or(cfg.theme);
@@ -80,7 +93,6 @@ fn main() -> Result<()> {
 }
 
 async fn run_tui(theme_name: Option<String>) -> Result<()> {
-    macwifi::location::request_when_in_use();
     let mut tui = Tui::init()?;
     let result = drive(&mut tui, theme_name.as_deref()).await;
     let _ = Tui::restore();
@@ -91,199 +103,213 @@ async fn run_tui(theme_name: Option<String>) -> Result<()> {
 }
 
 async fn drive(tui: &mut Tui, theme_name: Option<&str>) -> Result<()> {
-    let mut events = EventHandler::new(250);
-    let wifi = WifiHandle::spawn(events.tx.clone());
+    let mut ui_events = UiEventHandler::new(250);
+    let (wire_tx, mut wire_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let remote = RemoteWifiHandle::connect(wire_tx.clone()).await?;
+    let wifi = WifiHandle::Remote(remote.clone());
     let mut app = App::new(wifi, theme_name);
 
-    if let Some(hint) = macwifi::location::redaction_hint() {
-        let _ = events.tx.send(Event::Error(hint.to_string()));
-    }
+    // Ask the daemon for an initial snapshot so the TUI isn't blank on open.
+    remote.send(Request::RefreshState);
+    remote.send(Request::RefreshPreferred);
+    remote.send(Request::Scan);
 
     while app.running {
         tui.terminal.draw(|f| ui::draw(f, &mut app))?;
-        let ev = events.next().await?;
-        match ev {
-            Event::Tick => app.tick(),
-            Event::Key(k) => handler::handle_key(&mut app, k),
-            Event::Resize(_, _) => {}
-            other => app.handle_event(other),
+        tokio::select! {
+            ui_ev = ui_events.next() => match ui_ev? {
+                UiEvent::Tick => app.tick(),
+                UiEvent::Key(k) => handler::handle_key(&mut app, k),
+                UiEvent::Resize(_, _) => {}
+            },
+            Some(wire_ev) = wire_rx.recv() => {
+                app.handle_event(wire_ev);
+            }
         }
     }
     Ok(())
 }
 
-fn run_cli(cmd: Cmd) -> Result<()> {
-    let client = WifiClient::shared()?;
-    let iface = client.default_interface()?;
-
+async fn run_cli(cmd: Cmd) -> Result<()> {
     match cmd {
+        Cmd::Daemon => macwifi::daemon::run().await,
         Cmd::Status => {
-            let s = iface.state()?;
-            println!("interface : {}", s.name);
-            println!("powered   : {}", s.powered);
-            println!("hw addr   : {}", s.hw_address.as_deref().unwrap_or("-"));
-            println!("ssid      : {}", s.ssid.as_deref().unwrap_or("-"));
-            println!("bssid     : {}", s.bssid.as_deref().unwrap_or("-"));
-            println!("rssi      : {} dBm", s.rssi);
-            println!("noise     : {} dBm", s.noise);
-            println!("tx rate   : {} Mbps", s.tx_rate);
-            println!(
-                "channel   : {}",
-                s.channel.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
-            );
+            let evs = cli_one_shot(Request::RefreshState, |e| matches!(e, Event::State(_))).await?;
+            for ev in evs {
+                if let Event::State(s) = ev {
+                    println!("interface : {}", s.name);
+                    println!("powered   : {}", s.powered);
+                    println!("hw addr   : {}", s.hw_address.as_deref().unwrap_or("-"));
+                    println!("ssid      : {}", s.ssid.as_deref().unwrap_or("-"));
+                    println!("bssid     : {}", s.bssid.as_deref().unwrap_or("-"));
+                    println!("rssi      : {} dBm", s.rssi);
+                    println!("noise     : {} dBm", s.noise);
+                    println!("tx rate   : {} Mbps", s.tx_rate);
+                    println!(
+                        "channel   : {}",
+                        s.channel.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
+                    );
+                }
+            }
+            Ok(())
         }
         Cmd::Scan => {
-            macwifi::location::request_when_in_use();
-            let mut nets = iface.scan()?;
-            nets.sort_by_key(|n| -n.rssi);
-            println!(
-                "{:<32}  {:>5}  {:>4}  {:<10}  {}",
-                "SSID", "RSSI", "CH", "SEC", "BSSID"
-            );
-            for n in &nets {
-                println!(
-                    "{:<32}  {:>5}  {:>4}  {:<10}  {}",
-                    n.ssid.as_deref().unwrap_or("<hidden>"),
-                    n.rssi,
-                    n.channel
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "?".into()),
-                    sec_label(n.security),
-                    n.bssid.as_deref().unwrap_or("-"),
-                );
+            let evs = cli_one_shot(Request::Scan, |e| matches!(e, Event::ScanResult(_))).await?;
+            for ev in evs {
+                if let Event::ScanResult(mut nets) = ev {
+                    nets.sort_by_key(|n| -n.rssi);
+                    println!(
+                        "{:<32}  {:>5}  {:>4}  {:<10}  {}",
+                        "SSID", "RSSI", "CH", "SEC", "BSSID"
+                    );
+                    for n in &nets {
+                        println!(
+                            "{:<32}  {:>5}  {:>4}  {:<10}  {}",
+                            n.ssid.as_deref().unwrap_or("<hidden>"),
+                            n.rssi,
+                            n.channel
+                                .map(|c| c.to_string())
+                                .unwrap_or_else(|| "?".into()),
+                            sec_label(n.security),
+                            n.bssid.as_deref().unwrap_or("-"),
+                        );
+                    }
+                }
             }
-            let all_blank = !nets.is_empty()
-                && nets
-                    .iter()
-                    .all(|n| n.ssid.as_deref().map_or(true, str::is_empty));
-            if all_blank {
-                eprintln!();
-                eprintln!(
-                    "! All SSIDs are blank. Grant Location Services to your terminal app"
-                );
-                eprintln!("! (System Settings → Privacy & Security → Location Services).");
-            }
+            Ok(())
         }
         Cmd::Power { state } => {
             let on = matches!(state, PowerState::On);
-            if let Err(e) = iface.set_power(on) {
-                eprintln!("CoreWLAN setPower failed ({e}); falling back to networksetup");
-                networksetup::set_power(&iface.name(), on)?;
-            }
+            let evs = cli_one_shot(Request::SetPower(on), is_notice_or_error).await?;
+            print_terminal_event(&evs);
+            Ok(())
         }
         Cmd::Connect { ssid, password } => {
-            match password {
-                Some(p) => iface.associate_psk(&ssid, &p)?,
-                None => iface.associate_open(&ssid)?,
-            }
-            println!("connected to {ssid}");
+            let req = match password {
+                Some(p) => Request::JoinWithPassword { ssid, password: p },
+                None => Request::Associate(macwifi::worker::Associate {
+                    ssid,
+                    kind: macwifi::worker::AssociateKind::Open,
+                }),
+            };
+            let evs = cli_one_shot(req, is_notice_or_error).await?;
+            print_terminal_event(&evs);
+            Ok(())
         }
         Cmd::ConnectHidden { ssid, password } => {
-            iface.scan_for_ssid(&ssid)?;
-            match password {
-                Some(p) => iface.associate_psk(&ssid, &p)?,
-                None => iface.associate_open(&ssid)?,
-            }
-            println!("connected to {ssid} (hidden)");
+            let req = Request::Associate(macwifi::worker::Associate {
+                ssid,
+                kind: macwifi::worker::AssociateKind::Hidden(password),
+            });
+            let evs = cli_one_shot(req, is_notice_or_error).await?;
+            print_terminal_event(&evs);
+            Ok(())
         }
         Cmd::ConnectPeap {
             ssid,
             username,
             password,
         } => {
-            iface.associate_peap(&ssid, &username, &password)?;
-            println!("connected to {ssid} (PEAP)");
+            let req = Request::Associate(macwifi::worker::Associate {
+                ssid,
+                kind: macwifi::worker::AssociateKind::Peap { username, password },
+            });
+            let evs = cli_one_shot(req, is_notice_or_error).await?;
+            print_terminal_event(&evs);
+            Ok(())
         }
         Cmd::Disconnect => {
-            iface.disassociate();
-            println!("disassociated");
+            let evs = cli_one_shot(Request::Disconnect, is_notice_or_error).await?;
+            print_terminal_event(&evs);
+            Ok(())
         }
         Cmd::Preferred => {
-            let name = iface.name();
-            for ssid in networksetup::list_preferred(&name)? {
-                println!("{ssid}");
+            let evs = cli_one_shot(Request::RefreshPreferred, |e| {
+                matches!(e, Event::PreferredResult(_))
+            })
+            .await?;
+            for ev in evs {
+                if let Event::PreferredResult(v) = ev {
+                    for ssid in v {
+                        println!("{ssid}");
+                    }
+                }
             }
+            Ok(())
         }
         Cmd::Forget { ssid } => {
-            networksetup::remove_preferred(&iface.name(), &ssid)?;
-            println!("removed {ssid} from preferred networks");
+            let evs = cli_one_shot(Request::Forget(ssid), is_notice_or_error).await?;
+            print_terminal_event(&evs);
+            Ok(())
         }
-        Cmd::Themes => unreachable!(),
-        Cmd::Diagnose => {
-            use objc2_core_location::CLLocationManager;
-            use std::io::Write;
-            // When stdout is not a tty (e.g. launched via `open .app`), also
-            // append to /tmp/macwifi-diagnose.log so we can read the result.
-            let log_path = "/tmp/macwifi-diagnose.log";
-            let mut log_file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(log_path)
-                .ok();
-            macro_rules! line {
-                ($($a:tt)*) => {{
-                    let s = format!($($a)*);
-                    println!("{s}");
-                    if let Some(f) = log_file.as_mut() { let _ = writeln!(f, "{s}"); }
-                }};
+        Cmd::Themes | Cmd::InstallDaemon | Cmd::UninstallDaemon => unreachable!(),
+        Cmd::Diagnose => run_diagnose().await,
+        // ShareReady never comes from the CLI; placeholder for completeness.
+    }
+}
+
+fn is_notice_or_error(ev: &Event) -> bool {
+    matches!(ev, Event::Notice(_) | Event::Error(_))
+}
+
+fn print_terminal_event(evs: &[Event]) {
+    if let Some(ev) = evs.last() {
+        match ev {
+            Event::Notice(s) => println!("{s}"),
+            Event::Error(s) => eprintln!("error: {s}"),
+            _ => {}
+        }
+    }
+}
+
+async fn run_diagnose() -> Result<()> {
+    use objc2_core_location::CLLocationManager;
+    let exe = std::env::current_exe().ok();
+    println!("== macwifi diagnose (client) ==");
+    if let Some(e) = &exe {
+        println!("executable        : {}", e.display());
+        let bundled = e.to_string_lossy().contains(".app/Contents/MacOS/");
+        println!("bundled           : {bundled}");
+    }
+    println!("parent pid        : {}", unsafe { libc::getppid() });
+    unsafe {
+        let mgr = CLLocationManager::new();
+        let status = mgr.authorizationStatus();
+        println!(
+            "location auth     : {status:?}  (0=notDet 1=restr 2=denied 3=always 4=whenInUse)"
+        );
+    }
+    println!("socket path       : {}", macwifi::ipc::socket_path().display());
+    println!();
+    println!("== macwifi diagnose (daemon) ==");
+    match cli_one_shot(Request::Diagnose, |e| matches!(e, Event::DaemonDiagnose(_))).await {
+        Ok(evs) => {
+            for ev in evs {
+                if let Event::DaemonDiagnose(d) = ev {
+                    println!("daemon pid        : {}", d.pid);
+                    println!("daemon parent pid : {}", d.parent_pid);
+                    println!(
+                        "daemon location   : {}  (0=notDet 1=restr 2=denied 3=always 4=whenInUse)",
+                        d.location_auth_raw
+                    );
+                    println!("interface         : {}", d.interface);
+                    println!(
+                        "current SSID      : {}",
+                        d.current_ssid.as_deref().unwrap_or("-")
+                    );
+                    println!(
+                        "scan              : {} networks, {} blank",
+                        d.scan_count, d.scan_blank
+                    );
+                }
             }
-            let exe = std::env::current_exe().ok();
-            line!("== macwifi diagnose {} ==", chrono_now());
-            if let Some(e) = &exe {
-                line!("executable        : {}", e.display());
-                let bundled = e.to_string_lossy().contains(".app/Contents/MacOS/");
-                line!("bundled           : {bundled}");
-            }
-            line!("parent pid        : {}", unsafe { libc_getppid() });
-            // Fire the Location prompt from the terminal session so it has
-            // time to actually render and the user can click Allow.
-            macwifi::location::request_when_in_use();
-            unsafe {
-                let mgr = CLLocationManager::new();
-                let status = mgr.authorizationStatus();
-                line!("location auth     : {status:?}  (0=notDet 1=restr 2=denied 3=always 4=whenInUse)");
-            }
-            let s = iface.state()?;
-            line!("interface         : {}", s.name);
-            line!("hw addr           : {}", s.hw_address.as_deref().unwrap_or("-"));
-            line!("current SSID      : {}", s.ssid.as_deref().unwrap_or("-"));
-            line!("current BSSID     : {}", s.bssid.as_deref().unwrap_or("-"));
-            line!("RSSI              : {} dBm", s.rssi);
-            let nets = iface.scan()?;
-            let blank = nets
-                .iter()
-                .filter(|n| n.ssid.as_deref().map_or(true, str::is_empty))
-                .count();
-            line!(
-                "scan              : {} networks, {} blank",
-                nets.len(),
-                blank
-            );
-            for n in nets.iter().take(5) {
-                line!(
-                    "  ssid={:?}  rssi={}  ch={:?}",
-                    n.ssid, n.rssi, n.channel
-                );
-            }
-            line!("");
+        }
+        Err(e) => {
+            eprintln!("daemon section unavailable: {e:#}");
+            eprintln!("(try `macwifi install-daemon`)");
         }
     }
     Ok(())
-}
-
-unsafe extern "C" {
-    fn getppid() -> i32;
-}
-unsafe fn libc_getppid() -> i32 {
-    unsafe { getppid() }
-}
-
-fn chrono_now() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| format!("epoch={}", d.as_secs()))
-        .unwrap_or_else(|_| "epoch=?".into())
 }
 
 fn sec_label(s: Security) -> &'static str {
@@ -299,3 +325,6 @@ fn sec_label(s: Security) -> &'static str {
         Security::Unknown => "?",
     }
 }
+
+#[allow(dead_code)]
+fn _suppress_unused(_: ShareSecurity) {}
