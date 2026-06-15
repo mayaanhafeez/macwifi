@@ -95,6 +95,10 @@ async fn drive(tui: &mut Tui, theme_name: Option<&str>) -> Result<()> {
     let wifi = WifiHandle::spawn(events.tx.clone());
     let mut app = App::new(wifi, theme_name);
 
+    if let Some(hint) = macwifi::location::redaction_hint() {
+        let _ = events.tx.send(Event::Error(hint.to_string()));
+    }
+
     while app.running {
         tui.terminal.draw(|f| ui::draw(f, &mut app))?;
         let ev = events.next().await?;
@@ -207,43 +211,79 @@ fn run_cli(cmd: Cmd) -> Result<()> {
         Cmd::Themes => unreachable!(),
         Cmd::Diagnose => {
             use objc2_core_location::CLLocationManager;
-            let exe = std::env::current_exe().ok();
-            println!("== macwifi diagnose ==");
-            if let Some(e) = &exe {
-                println!("executable        : {}", e.display());
-                let bundled = e.to_string_lossy().contains(".app/Contents/MacOS/");
-                println!("bundled           : {bundled}");
+            use std::io::Write;
+            // When stdout is not a tty (e.g. launched via `open .app`), also
+            // append to /tmp/macwifi-diagnose.log so we can read the result.
+            let log_path = "/tmp/macwifi-diagnose.log";
+            let mut log_file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_path)
+                .ok();
+            macro_rules! line {
+                ($($a:tt)*) => {{
+                    let s = format!($($a)*);
+                    println!("{s}");
+                    if let Some(f) = log_file.as_mut() { let _ = writeln!(f, "{s}"); }
+                }};
             }
+            let exe = std::env::current_exe().ok();
+            line!("== macwifi diagnose {} ==", chrono_now());
+            if let Some(e) = &exe {
+                line!("executable        : {}", e.display());
+                let bundled = e.to_string_lossy().contains(".app/Contents/MacOS/");
+                line!("bundled           : {bundled}");
+            }
+            line!("parent pid        : {}", unsafe { libc_getppid() });
+            // Fire the Location prompt from the terminal session so it has
+            // time to actually render and the user can click Allow.
+            macwifi::location::request_when_in_use();
             unsafe {
                 let mgr = CLLocationManager::new();
                 let status = mgr.authorizationStatus();
-                println!("location auth     : {status:?}  (0=notDet 1=restr 2=denied 3=always 4=whenInUse)");
+                line!("location auth     : {status:?}  (0=notDet 1=restr 2=denied 3=always 4=whenInUse)");
             }
             let s = iface.state()?;
-            println!("interface         : {}", s.name);
-            println!("hw addr           : {}", s.hw_address.as_deref().unwrap_or("-"));
-            println!("current SSID      : {}", s.ssid.as_deref().unwrap_or("-"));
-            println!("current BSSID     : {}", s.bssid.as_deref().unwrap_or("-"));
-            println!("RSSI              : {} dBm", s.rssi);
+            line!("interface         : {}", s.name);
+            line!("hw addr           : {}", s.hw_address.as_deref().unwrap_or("-"));
+            line!("current SSID      : {}", s.ssid.as_deref().unwrap_or("-"));
+            line!("current BSSID     : {}", s.bssid.as_deref().unwrap_or("-"));
+            line!("RSSI              : {} dBm", s.rssi);
             let nets = iface.scan()?;
             let blank = nets
                 .iter()
                 .filter(|n| n.ssid.as_deref().map_or(true, str::is_empty))
                 .count();
-            println!(
+            line!(
                 "scan              : {} networks, {} blank",
                 nets.len(),
                 blank
             );
             for n in nets.iter().take(5) {
-                println!(
+                line!(
                     "  ssid={:?}  rssi={}  ch={:?}",
                     n.ssid, n.rssi, n.channel
                 );
             }
+            line!("");
         }
     }
     Ok(())
+}
+
+unsafe extern "C" {
+    fn getppid() -> i32;
+}
+unsafe fn libc_getppid() -> i32 {
+    unsafe { getppid() }
+}
+
+fn chrono_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| format!("epoch={}", d.as_secs()))
+        .unwrap_or_else(|_| "epoch=?".into())
 }
 
 fn sec_label(s: Security) -> &'static str {

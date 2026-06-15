@@ -152,32 +152,33 @@ fn worker_loop(rx: std_mpsc::Receiver<Request>, events: UnboundedSender<Event>) 
             }
             Request::JoinSaved(ssid) => {
                 let name = iface.name();
-                // (1) Let airportd try the Keychain itself — works if the
-                //     ACL permits.
-                if let Ok(()) = networksetup::set_airport_network(&name, &ssid, None) {
-                    let _ = events.send(Event::Notice(format!("connected to {ssid}")));
-                    emit_state(&iface, &events);
-                    continue;
-                }
-                // (2) Fall back to reading the password from Keychain on the
-                //     user's behalf. This pops the standard macOS Keychain
-                //     authorization dialog once per program; click Always
-                //     Allow to suppress it next time.
-                if let Ok(pw) = keychain::wifi_password(&ssid) {
-                    if let Ok(()) =
-                        networksetup::set_airport_network(&name, &ssid, Some(&pw))
-                    {
-                        let _ =
-                            events.send(Event::Notice(format!("connected to {ssid}")));
-                        emit_state(&iface, &events);
-                        continue;
+                // Read the saved password directly from the System keychain.
+                // First time per SSID this pops:
+                //   (1) keychain access dialog — user must click "Always
+                //       Allow" (not "Allow") to add our app to the item's
+                //       ACL;
+                //   (2) admin auth dialog — modifying the System keychain
+                //       ACL is privileged.
+                // After both, every subsequent JoinSaved for this SSID is
+                // silent for as long as our codesign identity stays stable
+                // (see CODESIGN_IDENTITY in scripts/bundle.sh).
+                match keychain::wifi_password(&ssid) {
+                    Ok(pw) => match networksetup::set_airport_network(&name, &ssid, Some(&pw)) {
+                        Ok(()) => {
+                            let _ = events.send(Event::Notice(format!("connected to {ssid}")));
+                        }
+                        Err(e) => {
+                            let _ = events
+                                .send(Event::Error(format!("join failed: {e}")));
+                        }
+                    },
+                    Err(e) => {
+                        let _ = events.send(Event::JoinSavedFailed {
+                            ssid,
+                            reason: format!("{e}"),
+                        });
                     }
                 }
-                // (3) Last resort: prompt the user.
-                let _ = events.send(Event::JoinSavedFailed {
-                    ssid,
-                    reason: "Keychain password unavailable".into(),
-                });
                 emit_state(&iface, &events);
             }
             Request::Disconnect => {
@@ -279,7 +280,22 @@ fn emit_scan(iface: &WifiInterface, events: &UnboundedSender<Event>) {
     match iface.scan() {
         Ok(mut n) => {
             n.sort_by_key(|x| -x.rssi);
+            let all_blank = !n.is_empty()
+                && n.iter()
+                    .all(|x| x.ssid.as_deref().map_or(true, str::is_empty));
             let _ = events.send(Event::ScanResult(n));
+            if all_blank {
+                if let Some(hint) = crate::location::redaction_hint() {
+                    let _ = events.send(Event::Error(hint.to_string()));
+                } else {
+                    // Location says we're authorized but SSIDs are still
+                    // redacted — almost always means the running executable
+                    // isn't the bundled one TCC granted.
+                    let _ = events.send(Event::Error(
+                        "SSIDs redacted despite Location auth — run via bundled .app (scripts/bundle.sh) so TCC matches this binary".into(),
+                    ));
+                }
+            }
         }
         Err(e) => {
             let _ = events.send(Event::Error(format!("scan failed: {e}")));

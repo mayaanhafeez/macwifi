@@ -1,6 +1,23 @@
 #!/usr/bin/env bash
 # Build a .app bundle around the macwifi binary so macOS will honor
-# NSLocationUsageDescription and stop redacting Wi-Fi SSIDs in scan results.
+# NSLocationUsageDescription (gates SSID visibility) and so Keychain ACLs
+# have a stable code-signing identity to bind to.
+#
+# Signing:
+#   By default we sign ad-hoc (`-`). Ad-hoc signatures are *not* stable
+#   across rebuilds — every build gets a fresh CDHash, which invalidates
+#   any per-item Keychain "Always Allow" grants the user has clicked.
+#
+#   To stop being re-prompted for Wi-Fi passwords after every `cargo build`,
+#   create a self-signed code-signing cert in Keychain Access:
+#       Keychain Access → Certificate Assistant → Create a Certificate
+#         Name:      macwifi-dev
+#         Identity:  Self Signed Root
+#         Type:      Code Signing
+#   Then run:
+#       CODESIGN_IDENTITY=macwifi-dev scripts/bundle.sh
+#
+#   For distribution, set CODESIGN_IDENTITY="Developer ID Application: …".
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -9,6 +26,7 @@ PROFILE="${PROFILE:-release}"
 BIN="$TARGET_DIR/$PROFILE/macwifi"
 APP="$TARGET_DIR/$PROFILE/macwifi.app"
 PLIST="$ROOT/bundle/Info.plist"
+IDENTITY="${CODESIGN_IDENTITY:--}"
 
 if [[ ! -f "$BIN" ]]; then
     echo "binary not found at $BIN" >&2
@@ -30,15 +48,20 @@ cp "$BIN" "$APP/Contents/MacOS/macwifi"
 cp "$PLIST" "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
-# Ad-hoc sign without hardened runtime. Hardened runtime + ad-hoc on
-# Sequoia/Tahoe interacts badly with TCC: tccd silently refuses prompts.
-# For distribution, replace "-" with "Developer ID Application: …".
+# Hardened runtime stays off: hardened + ad-hoc on Sequoia/Tahoe interacts
+# badly with TCC (tccd silently refuses prompts). With a real cert you can
+# add `--options runtime` here if you also notarize.
 codesign --force --deep \
-    --sign - \
+    --sign "$IDENTITY" \
     --identifier dev.macwifi.macwifi \
     "$APP"
 
-echo "bundled: $APP"
+if [[ "$IDENTITY" == "-" ]]; then
+    echo "bundled: $APP  (ad-hoc signed — Keychain grants will not persist across rebuilds)"
+    echo "  → set CODESIGN_IDENTITY=<cert-name> to fix"
+else
+    echo "bundled: $APP  (signed: $IDENTITY)"
+fi
 echo
 echo "next steps:"
 echo "  open $APP                                   # one-off launch (no terminal)"

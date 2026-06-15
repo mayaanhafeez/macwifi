@@ -40,6 +40,12 @@ pub struct HiddenPrompt {
     pub input: Input,
 }
 
+/// Cap on Preferred rows shown by default. macOS keeps every SSID you've
+/// ever joined; `networksetup -listpreferredwirelessnetworks` returns them
+/// in priority order, which is roughly recency, so the head of the list is
+/// almost always what the user wants. `A` toggles to the full list.
+pub const PREFERRED_DEFAULT_LIMIT: usize = 10;
+
 pub struct App {
     pub running: bool,
     pub focus: Focus,
@@ -48,6 +54,7 @@ pub struct App {
     pub preferred: Vec<String>,
     pub scanning: bool,
     pub show_all: bool,
+    pub show_all_preferred: bool,
     pub available_state: ListState,
     pub preferred_state: ListState,
     pub notifications: Vec<Notification>,
@@ -75,6 +82,7 @@ impl App {
             preferred: Vec::new(),
             scanning: true,
             show_all: false,
+            show_all_preferred: false,
             available_state,
             preferred_state,
             notifications: Vec::new(),
@@ -115,6 +123,28 @@ impl App {
         }
     }
 
+    pub fn toggle_show_all_preferred(&mut self) {
+        self.show_all_preferred = !self.show_all_preferred;
+        self.notifications.push(Notification::info(format!(
+            "all preferred: {}",
+            if self.show_all_preferred { "on" } else { "off" }
+        )));
+        let len = self.visible_preferred().len();
+        if len == 0 {
+            self.preferred_state.select(None);
+        } else if self.preferred_state.selected().map_or(true, |i| i >= len) {
+            self.preferred_state.select(Some(0));
+        }
+    }
+
+    pub fn visible_preferred(&self) -> &[String] {
+        if self.show_all_preferred || self.preferred.len() <= PREFERRED_DEFAULT_LIMIT {
+            &self.preferred
+        } else {
+            &self.preferred[..PREFERRED_DEFAULT_LIMIT]
+        }
+    }
+
     pub fn visible_networks(&self) -> Vec<&ScannedNetwork> {
         if self.show_all {
             self.networks.iter().collect()
@@ -144,13 +174,10 @@ impl App {
             }
             Event::PreferredResult(v) => {
                 self.preferred = v;
-                if self.preferred.is_empty() {
+                let len = self.visible_preferred().len();
+                if len == 0 {
                     self.preferred_state.select(None);
-                } else if self
-                    .preferred_state
-                    .selected()
-                    .map_or(true, |i| i >= self.preferred.len())
-                {
+                } else if self.preferred_state.selected().map_or(true, |i| i >= len) {
                     self.preferred_state.select(Some(0));
                 }
             }
@@ -159,7 +186,7 @@ impl App {
             Event::ShareReady(p) => self.overlay = Overlay::Share(p),
             Event::JoinSavedFailed { ssid, reason } => {
                 self.notifications.push(Notification::error(format!(
-                    "Keychain join failed — enter password ({reason})"
+                    "{ssid}: keychain read denied — enter password ({reason})"
                 )));
                 self.overlay = Overlay::Password(PasswordPrompt {
                     ssid,
@@ -177,14 +204,15 @@ impl App {
 
     pub fn selected_preferred(&self) -> Option<&String> {
         let i = self.preferred_state.selected()?;
-        self.preferred.get(i)
+        self.visible_preferred().get(i)
     }
 
     pub fn move_selection(&mut self, delta: isize) {
         let visible_len = self.visible_networks().len();
+        let preferred_len = self.visible_preferred().len();
         let (state, len) = match self.focus {
             Focus::Available => (&mut self.available_state, visible_len),
-            Focus::Preferred => (&mut self.preferred_state, self.preferred.len()),
+            Focus::Preferred => (&mut self.preferred_state, preferred_len),
         };
         if len == 0 {
             state.select(None);

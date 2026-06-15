@@ -36,6 +36,7 @@ fn handle_global(app: &mut App, key: KeyEvent) {
         (KeyCode::Char('h'), _) => app.start_hidden(),
         (KeyCode::Char('i'), _) => app.show_info(),
         (KeyCode::Char('a'), _) => app.toggle_show_all(),
+        (KeyCode::Char('A'), _) => app.toggle_show_all_preferred(),
         (KeyCode::Char('T'), _) => app.cycle_theme(1),
         (KeyCode::BackTab, _) => app.cycle_theme(-1),
         (KeyCode::Enter, _) => match app.focus {

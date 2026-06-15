@@ -9,7 +9,7 @@
 use anyhow::{Result, anyhow};
 use objc2::rc::Retained;
 use objc2_core_wlan::{CWInterface, CWNetwork, CWSecurity, CWWiFiClient};
-use objc2_foundation::{NSError, NSString};
+use objc2_foundation::{NSData, NSError, NSString};
 
 pub struct WifiClient {
     client: Retained<CWWiFiClient>,
@@ -76,11 +76,16 @@ impl WifiInterface {
 
     pub fn state(&self) -> Result<InterfaceState> {
         unsafe {
+            let ssid = self
+                .iface
+                .ssid()
+                .map(ns_string)
+                .or_else(|| self.iface.ssidData().and_then(ns_data_to_string));
             Ok(InterfaceState {
                 name: self.iface.interfaceName().map(ns_string).unwrap_or_default(),
                 powered: self.iface.powerOn(),
                 hw_address: self.iface.hardwareAddress().map(ns_string),
-                ssid: self.iface.ssid().map(ns_string),
+                ssid,
                 bssid: self.iface.bssid().map(ns_string),
                 rssi: self.iface.rssiValue(),
                 noise: self.iface.noiseMeasurement(),
@@ -187,8 +192,16 @@ impl WifiInterface {
 
 fn network_to_scanned(net: &CWNetwork) -> ScannedNetwork {
     unsafe {
+        // `ssid()` returns nil when CoreWLAN considers the caller untrusted,
+        // even with Location authorized — Sequoia/Tahoe behavior. The raw
+        // `ssidData()` bytes are often still populated; decode and use them
+        // as a fallback before declaring the network hidden.
+        let ssid = net
+            .ssid()
+            .map(ns_string)
+            .or_else(|| net.ssidData().and_then(ns_data_to_string));
         ScannedNetwork {
-            ssid: net.ssid().map(ns_string),
+            ssid,
             bssid: net.bssid().map(ns_string),
             rssi: net.rssiValue(),
             channel: net.wlanChannel().map(|c| c.channelNumber() as u32),
@@ -218,6 +231,14 @@ fn detect_security(net: &CWNetwork) -> Security {
 
 fn ns_string(s: Retained<NSString>) -> String {
     s.to_string()
+}
+
+fn ns_data_to_string(d: Retained<NSData>) -> Option<String> {
+    let bytes = d.to_vec();
+    if bytes.is_empty() {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 fn ns_error_message(err: &NSError) -> String {

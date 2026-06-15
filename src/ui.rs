@@ -103,13 +103,19 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_preferred(f: &mut Frame, area: Rect, app: &mut App) {
     let theme = app.theme;
-    let items: Vec<ListItem> = app
-        .preferred
+    let visible = app.visible_preferred();
+    let items: Vec<ListItem> = visible
         .iter()
         .map(|s| ListItem::new(s.clone()))
         .collect();
     let focused = app.focus == Focus::Preferred;
-    let title = format!(" Preferred ({}) ", app.preferred.len());
+    let total = app.preferred.len();
+    let shown = visible.len();
+    let title = if shown == total {
+        format!(" Preferred ({total}) ")
+    } else {
+        format!(" Preferred ({shown}/{total}) — A for all ")
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(title, style_fg(theme.title)))
@@ -161,7 +167,7 @@ fn draw_available(f: &mut Frame, area: Rect, app: &mut App) {
 
 fn draw_help(f: &mut Frame, area: Rect, theme: Theme) {
     let text =
-        " Tab focus │ j/k │ Enter connect │ s scan │ o power │ d forget │ x off │ p share │ h hidden │ i info │ a all │ T theme │ q quit ";
+        " Tab focus │ j/k │ Enter connect │ s scan │ o power │ d forget │ x off │ p share │ h hidden │ i info │ a all │ A all-pref │ T theme │ q quit ";
     f.render_widget(
         Paragraph::new(text).style(Style::default().bg(theme.bg).fg(theme.muted)),
         area,

@@ -61,6 +61,12 @@ objc2-core-location = { version = "0.3", features = [
 ] }
 objc2-core-foundation = { version = "0.3", features = ["CFRunLoop"] }
 
+# Security.framework bindings. We use SecKeychain to read Wi-Fi passwords
+# directly instead of shelling out to /usr/bin/security; the Keychain "Always
+# Allow" grant then attaches to our app's code-signing identity (so it
+# persists across runs) rather than to the system `security` binary.
+security-framework = "3"
+
 [profile.release]
 strip = true
 lto = "fat"
