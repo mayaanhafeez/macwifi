@@ -108,6 +108,7 @@ impl App {
         let len = theme::ALL.len() as isize;
         self.theme_index = ((self.theme_index as isize + delta).rem_euclid(len)) as usize;
         self.theme = theme::ALL[self.theme_index];
+        let _ = crate::config::Config::save_theme(self.theme.name);
         self.notifications
             .push(Notification::info(format!("theme: {}", self.theme.name)));
     }
