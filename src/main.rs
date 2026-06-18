@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use macwifi::app::App;
@@ -56,9 +56,12 @@ enum Cmd {
     InstallDaemon,
     /// Remove the LaunchAgent and stop the daemon.
     UninstallDaemon,
-    /// Add the daemon to the keychain ACL of every saved Wi-Fi network so
-    /// joins are silent (no per-connect admin prompt). Prompts admin once.
-    PreGrant,
+    /// Grant macwifi keychain access so later connects are silent. With no
+    /// args, grants every saved network; pass one or more SSIDs to grant just
+    /// those (admin password once per not-yet-granted network).
+    PreGrant {
+        ssids: Vec<String>,
+    },
     /// Internal helper invoked by `pre-grant` after re-execing under sudo.
     #[command(hide = true)]
     PreGrantInternal { ssids: Vec<String> },
@@ -81,11 +84,11 @@ fn main() -> Result<()> {
         }
         Some(Cmd::InstallDaemon) => macwifi::install::install(),
         Some(Cmd::UninstallDaemon) => macwifi::install::uninstall(),
-        Some(Cmd::PreGrant) => {
+        Some(Cmd::PreGrant { ssids }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(run_pre_grant())
+            rt.block_on(run_pre_grant(ssids))
         }
         Some(Cmd::PreGrantInternal { ssids }) => run_pre_grant_internal(ssids),
         Some(c) => {
@@ -258,69 +261,95 @@ async fn run_cli(cmd: Cmd) -> Result<()> {
         Cmd::Themes
         | Cmd::InstallDaemon
         | Cmd::UninstallDaemon
-        | Cmd::PreGrant
+        | Cmd::PreGrant { .. }
         | Cmd::PreGrantInternal { .. } => unreachable!(),
         Cmd::Diagnose => run_diagnose().await,
         // ShareReady never comes from the CLI; placeholder for completeness.
     }
 }
 
-async fn run_pre_grant() -> Result<()> {
-    // macOS prompts admin auth on every System keychain ACL write and
-    // sudo / AuthorizationCreate don't batch the rights — every
-    // SecKeychainItemSetAccess hits SecurityAgent independently. So
-    // automation can't make this a one-prompt flow. The least-bad UX is
-    // to print the SSID list, open Keychain Access at the System keychain,
-    // and tell the user how to drag the daemon onto each item.
-    let evs = cli_one_shot(Request::RefreshPreferred, |e| {
-        matches!(e, Event::PreferredResult(_))
-    })
-    .await?;
-    let ssids = evs
-        .into_iter()
-        .find_map(|ev| match ev {
-            Event::PreferredResult(v) => Some(v),
-            _ => None,
+async fn run_pre_grant(filter: Vec<String>) -> Result<()> {
+    // Two phases across privilege:
+    //   1. As the current user, probe each saved network to see whether macwifi
+    //      is already on its System-keychain ACL. This can't run as root — root
+    //      reads everything and would report every item "already granted".
+    //   2. For the items that need it, re-launch ourselves as root once (one
+    //      graphical admin prompt) to write the ACLs. The System keychain is
+    //      root-owned, so the write must be privileged.
+    use macwifi::keychain_grant::{ProbeResult, probe};
+
+    // Explicit SSIDs skip the daemon round-trip (handy for one network at a
+    // time); otherwise check every saved network the daemon reports.
+    let ssids = if !filter.is_empty() {
+        filter
+    } else {
+        let evs = cli_one_shot(Request::RefreshPreferred, |e| {
+            matches!(e, Event::PreferredResult(_))
         })
-        .unwrap_or_default();
+        .await?;
+        evs.into_iter()
+            .find_map(|ev| match ev {
+                Event::PreferredResult(v) => Some(v),
+                _ => None,
+            })
+            .unwrap_or_default()
+    };
     if ssids.is_empty() {
         println!("no saved Wi-Fi networks found");
         return Ok(());
     }
-    println!("Your saved Wi-Fi networks ({}):", ssids.len());
-    for s in &ssids {
-        println!("  - {s}");
+
+    println!("Checking {} saved network(s)…", ssids.len());
+    let mut need = Vec::new();
+    for ssid in &ssids {
+        match probe(ssid) {
+            Ok(ProbeResult::AlreadyGranted) => println!("  {ssid} … already granted"),
+            Ok(ProbeResult::NotFound) => println!("  {ssid} … no saved password"),
+            Ok(ProbeResult::NeedsGrant) => {
+                println!("  {ssid} … needs grant");
+                need.push(ssid.clone());
+            }
+            Err(e) => println!("  {ssid} … probe error ({e})"),
+        }
     }
-    println!();
-    println!("macOS requires admin auth on every System-keychain ACL write");
-    println!("and won't batch them, so do this manually (per SSID you use):");
-    println!();
-    println!("  1. The Keychain Access window will open at the System keychain");
-    println!("  2. Search for the SSID");
-    println!("  3. Double-click → Access Control tab → '+' button");
-    println!("  4. Cmd-Shift-G, paste: /Applications/macwifi.app/Contents/MacOS/macwifi");
-    println!("  5. Add → Save Changes → admin password");
-    println!();
-    println!("You only need to do this for SSIDs you actively use. Press Enter");
-    println!("to open Keychain Access, or Ctrl-C to skip.");
-    let mut buf = String::new();
-    let _ = std::io::stdin().read_line(&mut buf);
-    std::process::Command::new("open")
-        .args([
-            "-a",
-            "Keychain Access",
-            "/Library/Keychains/System.keychain",
-        ])
-        .status()
-        .ok();
+
+    if need.is_empty() {
+        println!("\nNothing to grant — all set.");
+        return Ok(());
+    }
+
+    println!(
+        "\nGranting {} network(s). macOS will show ONE admin-password prompt.",
+        need.len()
+    );
+    let tool = std::env::current_exe()
+        .and_then(|p| p.canonicalize())
+        .context("resolve own executable path")?;
+    let tool = tool
+        .to_str()
+        .context("executable path is not valid UTF-8")?
+        .to_string();
+    let mut args = vec!["pre-grant-internal".to_string()];
+    args.extend(need);
+    macwifi::privileged::exec_as_root(&tool, &args)?;
+    println!("\nConnecting to the granted networks should no longer prompt.");
     Ok(())
 }
 
-fn run_pre_grant_internal(_ssids: Vec<String>) -> Result<()> {
-    // Retained as a hidden subcommand only for backwards compatibility with
-    // a possible sudo re-exec from older copies of the binary; not used in
-    // the current flow.
-    anyhow::bail!("pre-grant-internal is no longer used; run `macwifi pre-grant`")
+/// Privileged half of `pre-grant`, run as root via `AuthorizationExecuteWith-
+/// Privileges`. Writes each item's ACL (the part that needs root). Output is
+/// relayed back to the user-facing process through the authorization pipe.
+fn run_pre_grant_internal(ssids: Vec<String>) -> Result<()> {
+    use macwifi::keychain_grant::add_to_acl;
+    for ssid in &ssids {
+        use std::io::Write;
+        match add_to_acl(ssid) {
+            Ok(()) => println!("  {ssid} … granted"),
+            Err(e) => println!("  {ssid} … failed ({e})"),
+        }
+        let _ = std::io::stdout().flush();
+    }
+    Ok(())
 }
 
 fn is_notice_or_error(ev: &Event) -> bool {
