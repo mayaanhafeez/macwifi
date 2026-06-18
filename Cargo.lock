@@ -931,6 +931,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "core-foundation-sys",
  "crossterm",
  "dirs",
  "futures",
