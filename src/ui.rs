@@ -1,8 +1,10 @@
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::layout::{Alignment, Constraint, Direction, Flex, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, Padding, Paragraph, Row, Table, TableState,
+};
 
 use crate::app::{App, Focus, Overlay};
 use crate::corewlan::{InterfaceState, Security};
@@ -12,25 +14,27 @@ use crate::theme::Theme;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    let theme = app.theme;
-    paint_background(f, area, theme);
 
+    // Layout mirrors impala's station mode: known networks on top, new
+    // networks below, the device table near the bottom, then the help line.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Length(8),
             Constraint::Min(5),
-            Constraint::Length(1),
+            Constraint::Min(5),
+            Constraint::Length(5),
+            Constraint::Length(2),
         ])
+        .margin(1)
         .split(area);
 
-    draw_status(f, chunks[0], app);
-    draw_preferred(f, chunks[1], app);
-    draw_available(f, chunks[2], app);
-    draw_help(f, chunks[3], theme);
-    draw_notifications(f, area, &app.notifications, theme);
+    draw_known_networks(f, chunks[0], app);
+    draw_new_networks(f, chunks[1], app);
+    draw_device(f, chunks[2], app);
+    draw_help(f, chunks[3], app.focus);
+    draw_notifications(f, area, &app.notifications, app.theme);
 
+    let theme = app.theme;
     match &app.overlay {
         Overlay::None => {}
         Overlay::Password(p) => draw_input(f, area, theme, "Password", &p.ssid, p.input.value(), true),
@@ -51,129 +55,351 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
-fn paint_background(f: &mut Frame, area: Rect, theme: Theme) {
-    let block = Block::default().style(Style::default().bg(theme.bg).fg(theme.fg));
-    f.render_widget(block, area);
-}
-
-fn draw_status(f: &mut Frame, area: Rect, app: &App) {
-    let theme = app.theme;
-    let mut spans = Vec::new();
-    if let Some(s) = &app.state {
-        let (label, color) = if s.powered {
-            ("ON", theme.ok)
-        } else {
-            ("OFF", theme.err)
-        };
-        spans.push(Span::styled(
-            format!(" {} ", s.name),
-            Style::default().fg(theme.title).add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled("│ ", style_fg(theme.muted)));
-        spans.push(Span::styled(
-            label,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled(" │ ", style_fg(theme.muted)));
-        spans.push(Span::raw("SSID: "));
-        spans.push(Span::styled(
-            s.ssid.clone().unwrap_or_else(|| "—".into()),
-            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::raw(format!("  RSSI: {} dBm", s.rssi)));
-        if let Some(c) = s.channel {
-            spans.push(Span::raw(format!("  CH: {c}")));
-        }
-        spans.push(Span::raw(format!("  TX: {:.0} Mbps", s.tx_rate)));
-        if app.scanning {
-            spans.push(Span::styled("  ⟳ scanning", style_fg(theme.warn)));
-        }
-    } else {
-        spans.push(Span::raw(" (no interface state yet) "));
-    }
-    let p = Paragraph::new(Line::from(spans)).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(style_fg(theme.border))
-            .title(Span::styled(" macwifi ", style_fg(theme.title).add_modifier(Modifier::BOLD)))
-            .style(Style::default().bg(theme.bg).fg(theme.fg)),
-    );
-    f.render_widget(p, area);
-}
-
-fn draw_preferred(f: &mut Frame, area: Rect, app: &mut App) {
-    let theme = app.theme;
-    let visible = app.visible_preferred();
-    let items: Vec<ListItem> = visible
-        .iter()
-        .map(|s| ListItem::new(s.clone()))
-        .collect();
+//
+// Known networks (macOS preferred networks) — impala's "Known Networks" table.
+//
+fn draw_known_networks(f: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.focus == Focus::Preferred;
-    let total = app.preferred.len();
-    let shown = visible.len();
-    let title = if shown == total {
-        format!(" Preferred ({total}) ")
-    } else {
-        format!(" Preferred ({shown}/{total}) — A for all ")
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(title, style_fg(theme.title)))
-        .border_style(border_style(theme, focused))
-        .style(Style::default().bg(theme.bg).fg(theme.fg));
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(highlight_style(theme, focused))
-        .highlight_symbol("▶ ");
-    f.render_stateful_widget(list, area, &mut app.preferred_state);
-}
+    let connected = app.state.as_ref().and_then(|s| s.ssid.clone());
 
-fn draw_available(f: &mut Frame, area: Rect, app: &mut App) {
-    let theme = app.theme;
-    let visible = app.visible_networks();
-    let items: Vec<ListItem> = visible
+    let visible = app.visible_preferred().to_vec();
+    let rows: Vec<Row> = visible
         .iter()
-        .map(|n| {
-            let ssid = n.ssid.clone().unwrap_or_else(|| "<hidden>".into());
-            let line = format!(
-                "{:<32}  {:>4} dBm  ch{:<3}  {}",
-                truncate(&ssid, 32),
-                n.rssi,
-                n.channel.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
-                sec_label(n.security),
-            );
-            ListItem::new(line)
+        .map(|ssid| {
+            let net = app.networks.iter().find(|n| n.ssid.as_deref() == Some(ssid));
+            let security = net
+                .map(|n| sec_label(n.security).to_string())
+                .unwrap_or_else(|| "-".into());
+            let signal = match net {
+                Some(n) => format!("{}%", signal_pct(n.rssi)),
+                None => "-".into(),
+            };
+            let icon = if connected.as_deref() == Some(ssid) {
+                "󰖩 "
+            } else {
+                ""
+            };
+            Row::new(vec![
+                Line::from(icon).centered(),
+                Line::from(ssid.clone()).centered(),
+                Line::from(security).centered(),
+                Line::from("No").centered(),
+                Line::from("Yes").centered(),
+                Line::from(signal).centered(),
+            ])
         })
         .collect();
+
+    let widths = [
+        Constraint::Length(2),
+        Constraint::Length(25),
+        Constraint::Length(8),
+        Constraint::Length(6),
+        Constraint::Length(12),
+        Constraint::Length(6),
+    ];
+
+    let header = if focused {
+        Row::new(vec![
+            Line::from(""),
+            Line::from("Name").yellow().centered(),
+            Line::from("Security").yellow().centered(),
+            Line::from("Hidden").yellow().centered(),
+            Line::from("Auto Connect").yellow().centered(),
+            Line::from("Signal").yellow().centered(),
+        ])
+        .style(Style::new().bold())
+        .bottom_margin(1)
+    } else {
+        Row::new(vec![
+            Line::from(""),
+            Line::from("Name").centered(),
+            Line::from("Security").centered(),
+            Line::from("Hidden").centered(),
+            Line::from("Auto Connect").centered(),
+            Line::from("Signal").centered(),
+        ])
+        .bottom_margin(1)
+    };
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(block(" Known Networks ", focused))
+        .column_spacing(1)
+        .flex(Flex::SpaceAround)
+        .row_highlight_style(highlight(focused));
+
+    f.render_stateful_widget(table, area, &mut app.preferred_state);
+}
+
+//
+// New networks (scan results) — impala's "New Networks" table.
+//
+fn draw_new_networks(f: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.focus == Focus::Available;
-    let title = format!(
-        " Available ({}/{}){}{}",
-        visible.len(),
-        app.networks.len(),
-        if app.scanning { " — scanning" } else { "" },
-        if app.show_all { " — all " } else { " " },
-    );
-    let block = Block::default()
+
+    let visible = app.visible_networks();
+    let rows: Vec<Row> = visible
+        .iter()
+        .map(|n| {
+            let name = n.ssid.clone().unwrap_or_else(|| "<hidden>".into());
+            let pct = signal_pct(n.rssi);
+            let signal = format!("{:3}% {}", pct, signal_icon(pct));
+            Row::new(vec![
+                Line::from(name).centered(),
+                Line::from(sec_label(n.security).to_string()).centered(),
+                Line::from(signal).centered(),
+            ])
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(25),
+        Constraint::Length(15),
+        Constraint::Length(8),
+    ];
+
+    let header = if focused {
+        Row::new(vec![
+            Line::from("Name").yellow().centered(),
+            Line::from("Security").yellow().centered(),
+            Line::from("Signal").yellow().centered(),
+        ])
+        .style(Style::new().bold())
+        .bottom_margin(1)
+    } else {
+        Row::new(vec![
+            Line::from("Name").centered(),
+            Line::from("Security").centered(),
+            Line::from("Signal").centered(),
+        ])
+        .bottom_margin(1)
+    };
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(block(" New Networks ", focused))
+        .column_spacing(1)
+        .flex(Flex::SpaceAround)
+        .row_highlight_style(highlight(focused));
+
+    f.render_stateful_widget(table, area, &mut app.available_state);
+}
+
+//
+// Device — impala's "Device" table.
+//
+fn draw_device(f: &mut Frame, area: Rect, app: &App) {
+    let row = match &app.state {
+        Some(s) => {
+            let security = s
+                .ssid
+                .as_deref()
+                .and_then(|ssid| app.networks.iter().find(|n| n.ssid.as_deref() == Some(ssid)))
+                .map(|n| sec_label(n.security).to_string())
+                .unwrap_or_else(|| "-".into());
+            Row::new(vec![
+                Line::from(s.name.clone()).centered(),
+                Line::from("station").centered(),
+                Line::from(if s.powered { "On" } else { "Off" }).centered(),
+                Line::from(if s.ssid.is_some() { "connected" } else { "disconnected" }).centered(),
+                Line::from(if app.scanning { "Yes" } else { "No" }).centered(),
+                Line::from(band(s.channel)).centered(),
+                Line::from(security).centered(),
+            ])
+        }
+        None => Row::new(vec![
+            Line::from("-").centered(),
+            Line::from("station").centered(),
+            Line::from("-").centered(),
+            Line::from("-").centered(),
+            Line::from(if app.scanning { "Yes" } else { "No" }).centered(),
+            Line::from("-").centered(),
+            Line::from("-").centered(),
+        ]),
+    };
+
+    let widths = [
+        Constraint::Length(10),
+        Constraint::Length(8),
+        Constraint::Length(10),
+        Constraint::Length(12),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(15),
+    ];
+
+    let header = Row::new(vec![
+        Line::from("Name").centered(),
+        Line::from("Mode").centered(),
+        Line::from("Powered").centered(),
+        Line::from("State").centered(),
+        Line::from("Scanning").centered(),
+        Line::from("Frequency").centered(),
+        Line::from("Security").centered(),
+    ])
+    .bottom_margin(1);
+
+    let table = Table::new(vec![row], widths)
+        .header(header)
+        .block(block(" Device ", false))
+        .column_spacing(1)
+        .flex(Flex::SpaceAround);
+
+    let mut state = TableState::default().with_selected(0);
+    f.render_stateful_widget(table, area, &mut state);
+}
+
+fn draw_help(f: &mut Frame, area: Rect, focus: Focus) {
+    let lines = match focus {
+        Focus::Preferred => vec![
+            Line::from(vec![
+                Span::from("k").bold(),
+                Span::from(" Up"),
+                Span::from(" | "),
+                Span::from("j").bold(),
+                Span::from(" Down"),
+                Span::from(" | "),
+                Span::from("↵").bold(),
+                Span::from(" Connect"),
+                Span::from(" | "),
+                Span::from("d").bold(),
+                Span::from(" Remove"),
+                Span::from(" | "),
+                Span::from("p").bold(),
+                Span::from(" Share"),
+                Span::from(" | "),
+                Span::from("A").bold(),
+                Span::from(" Show All"),
+                Span::from(" | "),
+                Span::from("tab").bold(),
+                Span::from(" Nav"),
+            ]),
+            Line::from(vec![
+                Span::from("s").bold(),
+                Span::from(" Scan"),
+                Span::from(" | "),
+                Span::from("o").bold(),
+                Span::from(" Power"),
+                Span::from(" | "),
+                Span::from("x").bold(),
+                Span::from(" Disconnect"),
+                Span::from(" | "),
+                Span::from("i").bold(),
+                Span::from(" Infos"),
+                Span::from(" | "),
+                Span::from("T").bold(),
+                Span::from(" Theme"),
+                Span::from(" | "),
+                Span::from("q").bold(),
+                Span::from(" Quit"),
+            ]),
+        ],
+        Focus::Available => vec![
+            Line::from(vec![
+                Span::from("k").bold(),
+                Span::from(" Up"),
+                Span::from(" | "),
+                Span::from("j").bold(),
+                Span::from(" Down"),
+                Span::from(" | "),
+                Span::from("↵").bold(),
+                Span::from(" Connect"),
+                Span::from(" | "),
+                Span::from("h").bold(),
+                Span::from(" Connect Hidden"),
+                Span::from(" | "),
+                Span::from("a").bold(),
+                Span::from(" Show All"),
+                Span::from(" | "),
+                Span::from("tab").bold(),
+                Span::from(" Nav"),
+            ]),
+            Line::from(vec![
+                Span::from("s").bold(),
+                Span::from(" Scan"),
+                Span::from(" | "),
+                Span::from("o").bold(),
+                Span::from(" Power"),
+                Span::from(" | "),
+                Span::from("x").bold(),
+                Span::from(" Disconnect"),
+                Span::from(" | "),
+                Span::from("i").bold(),
+                Span::from(" Infos"),
+                Span::from(" | "),
+                Span::from("T").bold(),
+                Span::from(" Theme"),
+                Span::from(" | "),
+                Span::from("q").bold(),
+                Span::from(" Quit"),
+            ]),
+        ],
+    };
+    f.render_widget(Paragraph::new(lines).centered().blue(), area);
+}
+
+//
+// Shared impala-style block / styling helpers (hardcoded colors, like impala).
+//
+fn block(title: &'static str, focused: bool) -> Block<'static> {
+    Block::default()
+        .title(title)
+        .title_style(if focused {
+            Style::default().bold()
+        } else {
+            Style::default()
+        })
         .borders(Borders::ALL)
-        .title(Span::styled(title, style_fg(theme.title)))
-        .border_style(border_style(theme, focused))
-        .style(Style::default().bg(theme.bg).fg(theme.fg));
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(highlight_style(theme, focused))
-        .highlight_symbol("▶ ");
-    f.render_stateful_widget(list, area, &mut app.available_state);
+        .border_style(if focused {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default()
+        })
+        .border_type(if focused {
+            BorderType::Thick
+        } else {
+            BorderType::default()
+        })
+        .padding(Padding::horizontal(1))
 }
 
-fn draw_help(f: &mut Frame, area: Rect, theme: Theme) {
-    let text =
-        " Tab focus │ j/k │ Enter connect │ s scan │ o power │ d forget │ x off │ p share │ h hidden │ i info │ a all │ A all-pref │ T theme │ q quit ";
-    f.render_widget(
-        Paragraph::new(text).style(Style::default().bg(theme.bg).fg(theme.muted)),
-        area,
-    );
+fn highlight(focused: bool) -> Style {
+    if focused {
+        Style::default().bg(Color::DarkGray).fg(Color::White)
+    } else {
+        Style::default()
+    }
 }
 
+fn signal_pct(dbm: isize) -> i64 {
+    if dbm >= -50 {
+        100
+    } else {
+        (2 * (100 + dbm as i64)).max(0)
+    }
+}
+
+fn signal_icon(pct: i64) -> char {
+    match pct {
+        n if n >= 75 => '󰤨',
+        n if (50..75).contains(&n) => '󰤥',
+        n if (25..50).contains(&n) => '󰤢',
+        _ => '󰤟',
+    }
+}
+
+fn band(channel: Option<u32>) -> String {
+    match channel {
+        Some(c) if (1..=14).contains(&c) => "2.4 GHz".into(),
+        Some(_) => "5 GHz".into(),
+        None => "-".into(),
+    }
+}
+
+//
+// Overlays / notifications (functional macwifi pieces, themed).
+//
 fn draw_notifications(f: &mut Frame, area: Rect, ns: &[Notification], theme: Theme) {
     if ns.is_empty() {
         return;
@@ -341,27 +567,6 @@ fn style_fg(c: Color) -> Style {
     Style::default().fg(c)
 }
 
-fn border_style(theme: Theme, focused: bool) -> Style {
-    if focused {
-        Style::default()
-            .fg(theme.border_focused)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme.border)
-    }
-}
-
-fn highlight_style(theme: Theme, focused: bool) -> Style {
-    if focused {
-        Style::default()
-            .bg(theme.accent)
-            .fg(theme.accent_fg)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().add_modifier(Modifier::REVERSED)
-    }
-}
-
 fn sec_label(s: Security) -> &'static str {
     match s {
         Security::Open => "open",
@@ -373,15 +578,5 @@ fn sec_label(s: Security) -> &'static str {
         Security::Wpa2Enterprise => "WPA2-E",
         Security::Wpa3Enterprise => "WPA3-E",
         Security::Unknown => "?",
-    }
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(n.saturating_sub(1)).collect();
-        out.push('…');
-        out
     }
 }

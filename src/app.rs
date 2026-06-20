@@ -1,4 +1,4 @@
-use ratatui::widgets::ListState;
+use ratatui::widgets::TableState;
 use tui_input::Input;
 
 use crate::corewlan::{InterfaceState, ScannedNetwork, Security};
@@ -55,8 +55,8 @@ pub struct App {
     pub scanning: bool,
     pub show_all: bool,
     pub show_all_preferred: bool,
-    pub available_state: ListState,
-    pub preferred_state: ListState,
+    pub available_state: TableState,
+    pub preferred_state: TableState,
     pub notifications: Vec<Notification>,
     pub overlay: Overlay,
     pub wifi: WifiHandle,
@@ -70,9 +70,9 @@ impl App {
             .and_then(theme::by_name)
             .unwrap_or(theme::DEFAULT);
         let theme_index = theme::index_of(theme.name);
-        let mut available_state = ListState::default();
+        let mut available_state = TableState::default();
         available_state.select(Some(0));
-        let mut preferred_state = ListState::default();
+        let mut preferred_state = TableState::default();
         preferred_state.select(Some(0));
         Self {
             running: true,
@@ -147,16 +147,25 @@ impl App {
     }
 
     pub fn visible_networks(&self) -> Vec<&ScannedNetwork> {
-        if self.show_all {
-            self.networks.iter().collect()
-        } else {
-            self.networks
-                .iter()
-                .filter(|n| {
-                    n.ssid.as_deref().map_or(false, |s| !s.is_empty()) && n.rssi > -85
-                })
-                .collect()
-        }
+        self.networks
+            .iter()
+            .filter(|n| {
+                // impala parity: a scanned network we already have a saved
+                // profile for belongs in the Known/Preferred table, never in
+                // New Networks. Drop it here regardless of `show_all`.
+                let known = n
+                    .ssid
+                    .as_deref()
+                    .map_or(false, |s| self.preferred.iter().any(|p| p == s));
+                if known {
+                    return false;
+                }
+                // `show_all` additionally reveals weak-signal and
+                // hidden/redacted networks that are otherwise filtered out.
+                self.show_all
+                    || (n.ssid.as_deref().map_or(false, |s| !s.is_empty()) && n.rssi > -85)
+            })
+            .collect()
     }
 
     pub fn handle_event(&mut self, ev: Event) {
