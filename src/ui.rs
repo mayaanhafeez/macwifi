@@ -92,7 +92,7 @@ fn draw_known_networks(f: &mut Frame, area: Rect, app: &mut App) {
 
     let widths = [
         Constraint::Length(2),
-        Constraint::Length(25),
+        Constraint::Fill(1),
         Constraint::Length(8),
         Constraint::Length(6),
         Constraint::Length(12),
@@ -154,7 +154,7 @@ fn draw_new_networks(f: &mut Frame, area: Rect, app: &mut App) {
         .collect();
 
     let widths = [
-        Constraint::Length(25),
+        Constraint::Fill(1),
         Constraint::Length(15),
         Constraint::Length(8),
     ];
