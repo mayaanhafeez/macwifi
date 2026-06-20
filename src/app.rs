@@ -147,16 +147,25 @@ impl App {
     }
 
     pub fn visible_networks(&self) -> Vec<&ScannedNetwork> {
-        if self.show_all {
-            self.networks.iter().collect()
-        } else {
-            self.networks
-                .iter()
-                .filter(|n| {
-                    n.ssid.as_deref().map_or(false, |s| !s.is_empty()) && n.rssi > -85
-                })
-                .collect()
-        }
+        self.networks
+            .iter()
+            .filter(|n| {
+                // impala parity: a scanned network we already have a saved
+                // profile for belongs in the Known/Preferred table, never in
+                // New Networks. Drop it here regardless of `show_all`.
+                let known = n
+                    .ssid
+                    .as_deref()
+                    .map_or(false, |s| self.preferred.iter().any(|p| p == s));
+                if known {
+                    return false;
+                }
+                // `show_all` additionally reveals weak-signal and
+                // hidden/redacted networks that are otherwise filtered out.
+                self.show_all
+                    || (n.ssid.as_deref().map_or(false, |s| !s.is_empty()) && n.rssi > -85)
+            })
+            .collect()
     }
 
     pub fn handle_event(&mut self, ev: Event) {
