@@ -10,7 +10,8 @@ Station mode only. Theming, hidden networks, QR sharing, adapter info, and a
 ## Features
 
 - Live scan & associate (open / WPA-PSK / WPA-Enterprise PEAP/MSCHAPv2 / hidden)
-- Manage saved networks (list, forget) and the current connection (disconnect, toggle power)
+- Both network lists sorted by signal strength (strongest first); out-of-range saved networks sink to the bottom
+- Manage saved networks (list, remove) and the current connection (disconnect, toggle power)
 - QR-code sharing of saved networks (pulls password from Keychain)
 - Adapter info popup: SSID, BSSID, RSSI, noise, channel, TX rate, MAC
 - **14 themes**: `default`, Catppuccin (latte/frappe/macchiato/mocha), Rose Pine (main/moon/dawn), Tokyo Night (night/storm), Gruvbox (dark/light), Nord, Dracula
@@ -20,20 +21,11 @@ Station mode only. Theming, hidden networks, QR sharing, adapter info, and a
 
 ## Demo
 
-```
-┌ macwifi ─────────────────────────────────────────────────────┐
-│ en0 │ ON │ SSID: MyNetwork  RSSI: -43 dBm  CH: 157  TX: 286 Mbps │
-└──────────────────────────────────────────────────────────────┘
-┌ Preferred (24) ──────────────────────────────────────────────┐
-│ ▶ MB_Lounge                                                  │
-│   AndroidAP_8011                                             │
-└──────────────────────────────────────────────────────────────┘
-┌ Available (9/12) ────────────────────────────────────────────┐
-│ ▶ MyNetwork                  -36 dBm  ch157   WPA2          │
-│   guest-wifi                 -42 dBm  ch5     open          │
-└──────────────────────────────────────────────────────────────┘
- Tab focus │ j/k │ Enter connect │ s scan │ o power │ d forget │ x off │ p share │ h hidden │ i info │ a all │ T theme │ q quit
-```
+![macwifi TUI showing the Known Networks, New Networks, and Device tables over a desktop wallpaper](images/demo.png)
+
+Three stacked tables — **Known Networks** (saved profiles), **New Networks**
+(in-range scan results), and **Device** (current interface) — both network
+lists sorted strongest-signal-first.
 
 ---
 
@@ -220,18 +212,18 @@ rm -rf ~/.config/macwifi
 
 | Key | Action |
 |-----|--------|
-| `Tab` | Toggle focus between Preferred / Available lists |
+| `Tab` | Toggle focus between Known Networks / New Networks lists |
 | `j` / `k` / `↓` / `↑` | Move selection |
 | `Enter` | Connect (password / enterprise overlays appear as needed) |
 | `s` | Rescan |
 | `o` | Toggle radio power on/off |
-| `d` | Forget the selected saved network |
+| `d` | Remove the selected saved network (Known Networks) |
 | `x` | Disconnect |
-| `p` | Share selected saved network as a QR code |
-| `h` | Connect to a hidden network |
+| `p` | Share selected saved network as a QR code (Known Networks) |
+| `h` | Connect to a hidden network (New Networks) |
 | `i` | Adapter info popup |
-| `a` | Show all networks (disable RSSI/SSID filter) |
-| `A` | Show full preferred list (default: top 10) |
+| `a` | Show all networks — disable RSSI/SSID filter (New Networks) |
+| `A` | Show full saved-network list — default: top 10 (Known Networks) |
 | `T` | Cycle theme forward |
 | `Shift-Tab` | Cycle theme backward |
 | `q` / `Esc` / `Ctrl-C` | Quit (or dismiss overlay) |

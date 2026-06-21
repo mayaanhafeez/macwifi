@@ -138,6 +138,24 @@ impl App {
         }
     }
 
+    /// Order known networks strongest-signal-first using the latest scan
+    /// results. Networks not currently in range (no scan match) have no RSSI,
+    /// so they sink below every in-range one. Must be re-run whenever either
+    /// the preferred list or the scan results change.
+    fn sort_preferred_by_signal(&mut self) {
+        let networks = &self.networks;
+        self.preferred.sort_by(|a, b| {
+            let rssi = |ssid: &str| {
+                networks
+                    .iter()
+                    .find(|n| n.ssid.as_deref() == Some(ssid))
+                    .map(|n| n.rssi)
+            };
+            // Some(strong) > Some(weak) > None; reverse for strongest first.
+            rssi(b).cmp(&rssi(a))
+        });
+    }
+
     pub fn visible_preferred(&self) -> &[String] {
         if self.show_all_preferred || self.preferred.len() <= PREFERRED_DEFAULT_LIMIT {
             &self.preferred
@@ -147,7 +165,7 @@ impl App {
     }
 
     pub fn visible_networks(&self) -> Vec<&ScannedNetwork> {
-        self.networks
+        let mut out = self.networks
             .iter()
             .filter(|n| {
                 // impala parity: a scanned network we already have a saved
@@ -165,7 +183,10 @@ impl App {
                 self.show_all
                     || (n.ssid.as_deref().map_or(false, |s| !s.is_empty()) && n.rssi > -85)
             })
-            .collect()
+            .collect::<Vec<_>>();
+        // Sort strongest signal first (RSSI is negative; higher = stronger).
+        out.sort_by(|a, b| b.rssi.cmp(&a.rssi));
+        out
     }
 
     pub fn handle_event(&mut self, ev: Event) {
@@ -175,6 +196,7 @@ impl App {
             Event::ScanResult(n) => {
                 self.networks = n;
                 self.scanning = false;
+                self.sort_preferred_by_signal();
                 let len = self.visible_networks().len();
                 if len == 0 {
                     self.available_state.select(None);
@@ -184,6 +206,7 @@ impl App {
             }
             Event::PreferredResult(v) => {
                 self.preferred = v;
+                self.sort_preferred_by_signal();
                 let len = self.visible_preferred().len();
                 if len == 0 {
                     self.preferred_state.select(None);
