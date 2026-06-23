@@ -22,11 +22,6 @@ use crate::ipc::{self, Hello, Reader, Writer};
 use crate::worker::{LocalWifiHandle, Request};
 
 pub async fn run() -> Result<()> {
-    // Fire Location prompt + start the CFRunLoop pump. Runs forever on a
-    // background thread; we need it both for TCC and for CoreWLAN's
-    // "process behaves like a GUI app" check.
-    crate::location::request_when_in_use();
-
     let path = ipc::socket_path();
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
@@ -40,6 +35,14 @@ pub async fn run() -> Result<()> {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod 0600 {}", path.display()))?;
     eprintln!("macwifi-daemon listening at {}", path.display());
+
+    // Fire Location prompt + start the CFRunLoop pump. Runs forever on a
+    // background thread; we need it both for TCC and for CoreWLAN's
+    // "process behaves like a GUI app" check. This is done *after* binding the
+    // socket: on a first-ever launch it can block up to 30s waiting for the
+    // user to answer the TCC prompt, and doing it before the bind would make
+    // the TUI's 2s connect retry give up with "daemon unreachable".
+    crate::location::request_when_in_use();
 
     let (worker_tx, mut worker_rx) = mpsc::unbounded_channel::<Event>();
     let wifi = LocalWifiHandle::spawn(worker_tx);

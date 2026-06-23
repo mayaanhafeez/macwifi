@@ -171,8 +171,13 @@ fn worker_loop(rx: std_mpsc::Receiver<Request>, events: UnboundedSender<Event>) 
             Request::JoinWithPassword { ssid, password } => {
                 let name = iface.name();
                 match networksetup::set_airport_network(&name, &ssid, Some(&password)) {
-                    Ok(()) => {
+                    Ok(()) if verify_join(&iface, &ssid) => {
                         let _ = events.send(Event::Notice(format!("connected to {ssid}")));
+                    }
+                    Ok(()) => {
+                        let _ = events.send(Event::Error(format!(
+                            "join to {ssid} did not take effect — check the password"
+                        )));
                     }
                     Err(e) => {
                         let _ = events.send(Event::Error(format!("join failed: {e}")));
@@ -195,6 +200,15 @@ fn worker_loop(rx: std_mpsc::Receiver<Request>, events: UnboundedSender<Event>) 
                     keychain::wifi_password(&ssid)
                         .and_then(|pw| {
                             networksetup::set_airport_network(&name, &ssid, Some(&pw))
+                        })
+                        .and_then(|()| {
+                            // `networksetup` reports success even on a bad join
+                            // (and only in English), so confirm via CoreWLAN.
+                            if verify_join(&iface, &ssid) {
+                                Ok(())
+                            } else {
+                                Err(anyhow::anyhow!("join did not take effect"))
+                            }
                         })
                         .map_err(|e| anyhow::anyhow!("{first_err}; fallback failed: {e}"))
                 });
@@ -312,6 +326,24 @@ fn emit_state(iface: &WifiInterface, events: &UnboundedSender<Event>) {
             let _ = events.send(Event::Error(format!("state refresh failed: {e}")));
         }
     }
+}
+
+/// Confirm a `networksetup`-driven join actually took effect, independent of
+/// locale. `networksetup -setairportnetwork` exits 0 and prints a *localized*
+/// "Failed…" line on auth/password errors, so the only trustworthy signal is
+/// reading back the interface's current SSID via CoreWLAN. Association can lag
+/// the command's return by a moment, so poll briefly. (The daemon holds the
+/// Location grant, so the SSID readback isn't redacted here.)
+fn verify_join(iface: &WifiInterface, ssid: &str) -> bool {
+    for _ in 0..6 {
+        if let Ok(st) = iface.state() {
+            if st.ssid.as_deref() == Some(ssid) {
+                return true;
+            }
+        }
+        thread::sleep(std::time::Duration::from_millis(500));
+    }
+    false
 }
 
 fn emit_preferred(iface: &WifiInterface, events: &UnboundedSender<Event>) {

@@ -109,9 +109,14 @@ fn main() -> Result<()> {
 }
 
 async fn run_tui(theme_name: Option<String>) -> Result<()> {
-    let mut tui = Tui::init()?;
-    let result = drive(&mut tui, theme_name.as_deref()).await;
-    let _ = Tui::restore();
+    // Scope the `Tui` so its `Drop` restores the terminal exactly once, before
+    // we print any error. Calling `Tui::restore()` here *and* letting `Drop`
+    // run would emit `LeaveAlternateScreen` twice, which corrupts some
+    // terminal emulators.
+    let result = {
+        let mut tui = Tui::init()?;
+        drive(&mut tui, theme_name.as_deref()).await
+    };
     if let Err(e) = &result {
         eprintln!("error: {e:?}");
     }
@@ -121,14 +126,11 @@ async fn run_tui(theme_name: Option<String>) -> Result<()> {
 async fn drive(tui: &mut Tui, theme_name: Option<&str>) -> Result<()> {
     let mut ui_events = UiEventHandler::new(250);
     let (wire_tx, mut wire_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    // The remote handle requests an initial snapshot on every (re)connect, so
+    // the TUI doesn't need to prime it here.
     let remote = RemoteWifiHandle::connect(wire_tx.clone()).await?;
-    let wifi = WifiHandle::Remote(remote.clone());
+    let wifi = WifiHandle::Remote(remote);
     let mut app = App::new(wifi, theme_name);
-
-    // Ask the daemon for an initial snapshot so the TUI isn't blank on open.
-    remote.send(Request::RefreshState);
-    remote.send(Request::RefreshPreferred);
-    remote.send(Request::Scan);
 
     while app.running {
         tui.terminal.draw(|f| ui::draw(f, &mut app))?;

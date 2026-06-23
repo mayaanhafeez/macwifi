@@ -268,8 +268,15 @@ impl App {
             return;
         };
         let Some(ssid) = net.ssid.clone() else {
-            self.notifications
-                .push(Notification::error("network has no SSID — grant Location permission"));
+            // A blank SSID means either Location is denied (CoreWLAN redacts
+            // every name) or this is a genuinely hidden network (no broadcast
+            // name). Distinguish the two so the hint is actionable.
+            let msg = if crate::location::auth_status().is_authorized() {
+                "hidden network — use the hidden-SSID join (h) to connect by name"
+            } else {
+                "network names hidden — grant Location permission to macwifi.app"
+            };
+            self.notifications.push(Notification::error(msg));
             return;
         };
         match net.security {
@@ -320,20 +327,33 @@ impl App {
         let Some(ssid) = self.selected_preferred().cloned() else {
             return;
         };
-        let security = self.security_for(&ssid);
+        let Some(security) = self.security_for(&ssid) else {
+            self.notifications.push(Notification::error(
+                "can't share enterprise networks — no shareable password",
+            ));
+            return;
+        };
         self.wifi.send(Request::Share { ssid, security });
     }
 
-    fn security_for(&self, ssid: &str) -> ShareSecurity {
+    /// Map a network's security to a shareable QR type. Returns `None` for
+    /// enterprise networks: their credentials aren't stored as a generic
+    /// keychain password, so a `WIFI:` URI would carry no usable key.
+    /// Networks not present in the latest scan default to WPA (the common case
+    /// for a saved-but-out-of-range network).
+    fn security_for(&self, ssid: &str) -> Option<ShareSecurity> {
         match self
             .networks
             .iter()
             .find(|n| n.ssid.as_deref() == Some(ssid))
             .map(|n| n.security)
         {
-            Some(Security::Open) => ShareSecurity::Nopass,
-            Some(Security::Wep) => ShareSecurity::Wep,
-            _ => ShareSecurity::Wpa,
+            Some(Security::Open) => Some(ShareSecurity::Nopass),
+            Some(Security::Wep) => Some(ShareSecurity::Wep),
+            Some(
+                Security::WpaEnterprise | Security::Wpa2Enterprise | Security::Wpa3Enterprise,
+            ) => None,
+            _ => Some(ShareSecurity::Wpa),
         }
     }
 
