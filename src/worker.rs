@@ -172,6 +172,11 @@ fn worker_loop(rx: std_mpsc::Receiver<Request>, events: UnboundedSender<Event>) 
                 let name = iface.name();
                 match networksetup::set_airport_network(&name, &ssid, Some(&password)) {
                     Ok(()) if verify_join(&iface, &ssid) => {
+                        // Cache our own copy so future reconnects are silent.
+                        // Best-effort: a cache miss just means we prompt again.
+                        if let Err(e) = keychain::cache_password(&ssid, &password) {
+                            eprintln!("warning: could not cache password for {ssid}: {e}");
+                        }
                         let _ = events.send(Event::Notice(format!("connected to {ssid}")));
                     }
                     Ok(()) => {
@@ -186,42 +191,33 @@ fn worker_loop(rx: std_mpsc::Receiver<Request>, events: UnboundedSender<Event>) 
                 emit_state(&iface, &events);
             }
             Request::JoinSaved(ssid) => {
-                // In the daemon's launchd-spawned Aqua session, CoreWLAN's
-                // `associateToNetwork:password:nil` looks up the saved
-                // credential internally with no UI prompt — much nicer than
-                // reading the System keychain ourselves, which fires the
-                // admin-auth dialog on every connect because there's no
-                // persistent "Always Allow" path for the System keychain.
-                let result = iface.associate_open(&ssid).or_else(|first_err| {
-                    // CoreWLAN couldn't find or use a saved credential.
-                    // Fall back to an explicit keychain read so the user
-                    // gets the legacy auth-and-join flow.
-                    let name = iface.name();
-                    keychain::wifi_password(&ssid)
-                        .and_then(|pw| {
-                            networksetup::set_airport_network(&name, &ssid, Some(&pw))
-                        })
-                        .and_then(|()| {
-                            // `networksetup` reports success even on a bad join
-                            // (and only in English), so confirm via CoreWLAN.
-                            if verify_join(&iface, &ssid) {
-                                Ok(())
-                            } else {
-                                Err(anyhow::anyhow!("join did not take effect"))
-                            }
-                        })
-                        .map_err(|e| anyhow::anyhow!("{first_err}; fallback failed: {e}"))
-                });
-                match result {
-                    Ok(()) => {
-                        let _ = events.send(Event::Notice(format!("connected to {ssid}")));
+                // Silent-reconnect strategy, cheapest first:
+                //   1. If macwifi has cached this network's password in the login
+                //      keychain (from a prior connect), read it back silently and
+                //      associate with it. This is the only reliable silent path
+                //      for secured networks — the System keychain's copy is walled
+                //      off by a partition-list ACL even from root (the -25308/
+                //      -25293 finding; see keychain.rs).
+                //   2. Otherwise try CoreWLAN's `associateToNetwork:password:nil`,
+                //      which works for open networks and any secured network whose
+                //      credential wifid can supply internally.
+                //   3. If neither connects, ask the user for the password. We do
+                //      NOT read the System keychain here — it fires a useless admin
+                //      dialog and fails anyway.
+                let joined = match keychain::cached_password(&ssid) {
+                    Ok(Some(pw)) => {
+                        iface.associate_psk(&ssid, &pw).is_ok() && verify_join(&iface, &ssid)
                     }
-                    Err(e) => {
-                        let _ = events.send(Event::JoinSavedFailed {
-                            ssid,
-                            reason: format!("{e}"),
-                        });
-                    }
+                    _ => false,
+                } || (iface.associate_open(&ssid).is_ok() && verify_join(&iface, &ssid));
+
+                if joined {
+                    let _ = events.send(Event::Notice(format!("connected to {ssid}")));
+                } else {
+                    let _ = events.send(Event::JoinSavedFailed {
+                        ssid,
+                        reason: "saved credential unavailable".into(),
+                    });
                 }
                 emit_state(&iface, &events);
             }
@@ -271,6 +267,9 @@ fn worker_loop(rx: std_mpsc::Receiver<Request>, events: UnboundedSender<Event>) 
             }
             Request::Forget(ssid) => {
                 let name = iface.name();
+                // Drop our cached login-keychain copy too, so a forgotten
+                // network doesn't silently reconnect from our cache later.
+                let _ = keychain::forget_cached(&ssid);
                 match networksetup::remove_preferred(&name, &ssid) {
                     Ok(()) => {
                         let _ = events.send(Event::Notice(format!("forgot {ssid}")));
