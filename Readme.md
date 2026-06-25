@@ -84,7 +84,7 @@ The certificate is stored in your login keychain and is ready to use immediately
 Clone the repo and build the release binary, then wrap it in a `.app` bundle:
 
 ```sh
-git clone https://github.com/<you>/macwifi
+git clone https://github.com/mayaanhafeez/macwifi
 cd macwifi
 
 cargo build --release
