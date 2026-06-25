@@ -12,7 +12,8 @@ Station mode only. Theming, hidden networks, QR sharing, adapter info, and a
 - Live scan & associate (open / WPA-PSK / WPA-Enterprise PEAP/MSCHAPv2 / hidden)
 - Both network lists sorted by signal strength (strongest first); out-of-range saved networks sink to the bottom
 - Manage saved networks (list, remove) and the current connection (disconnect, toggle power)
-- QR-code sharing of saved networks (pulls password from Keychain)
+- **Silent reconnect**: the password you type on first connect is cached in macwifi's own login-keychain item, so reconnecting to a saved network is promptless (see [Passwords & prompts](#passwords--prompts))
+- QR-code sharing of saved networks (reads the password from the System keychain — triggers one macOS admin-auth prompt per share)
 - Adapter info popup: SSID, BSSID, RSSI, noise, channel, TX rate, MAC
 - **14 themes**: `default`, Catppuccin (latte/frappe/macchiato/mocha), Rose Pine (main/moon/dawn), Tokyo Night (night/storm), Gruvbox (dark/light), Nord, Dracula
 - Cycle themes live with `T` / `Shift-Tab` — choice is persisted across launches
@@ -47,10 +48,13 @@ source "$HOME/.cargo/env"
 
 ### 2. Create a code-signing certificate (recommended, do once)
 
-macwifi's `.app` bundle must be code-signed so macOS lets it hold a stable
-Keychain identity. Without a stable identity, every rebuild invalidates any
-"Always Allow" Keychain grants you've clicked for your saved Wi-Fi networks,
-and macOS will re-prompt for each password on the next connect.
+macwifi's `.app` bundle should be code-signed with a **stable** identity. Two
+things are bound to that identity and break if it changes between rebuilds:
+
+- The **Location permission** (TCC) grant that un-redacts SSIDs.
+- macwifi's **cached Wi-Fi passwords** in the login keychain — the ACL on those
+  items is tied to the app's code signature, so a new signature means macwifi
+  can no longer read its own cache silently and you re-enter passwords.
 
 A free self-signed certificate is enough — you don't need an Apple Developer
 account for personal use.
@@ -69,8 +73,9 @@ account for personal use.
 The certificate is stored in your login keychain and is ready to use immediately.
 
 > **Skip this step?** You can still use macwifi — just leave `CODESIGN_IDENTITY`
-> unset and the bundle will be ad-hoc signed. It will work, but you'll get a
-> Keychain password prompt on every connect after a rebuild.
+> unset and the bundle will be ad-hoc signed. It works, but every rebuild gets a
+> new signature, so you'll have to re-grant Location and re-enter saved Wi-Fi
+> passwords after each rebuild.
 
 ---
 
@@ -98,10 +103,12 @@ This produces `target/release/macwifi.app`.
 ### 4. Install the app
 
 Copy the bundle to `/Applications` so the daemon LaunchAgent can find it at a
-stable path (it is hardcoded to `/Applications/macwifi.app`):
+stable path (it is hardcoded to `/Applications/macwifi.app`). Use `ditto`, not
+`cp -R` — `cp -R` corrupts the code signature, after which macOS kills every
+launch with `Killed: 9` (exit 137) and the daemon never starts:
 
 ```sh
-cp -R target/release/macwifi.app /Applications/
+ditto target/release/macwifi.app /Applications/macwifi.app
 ```
 
 Symlink the binary so you can run `macwifi` from any terminal:
@@ -159,34 +166,33 @@ macwifi
 macwifi
 ```
 
-The first connect to a saved WPA network will trigger a Keychain prompt asking
-whether to allow macwifi to read the saved password. Click **Always Allow** so
-it doesn't re-prompt after every session.
+The first time you connect to a secured network you'll be asked for its
+password. After that, macwifi caches it (in its own login-keychain item) and
+reconnects silently — no further prompts. See
+[Passwords & prompts](#passwords--prompts) for the full picture.
 
 ---
 
 ## Rebuilding after changes
 
-If you edit source code and rebuild, you must re-bundle and re-copy to
-`/Applications` so the running binary and the daemon's app path stay in sync:
+Use the reinstall script — it rebuilds, re-bundles, refreshes
+`/Applications/macwifi.app`, **re-signs** it (mandatory — see below), and
+re-bootstraps the daemon, with a sanity check that catches a bad signature:
 
 ```sh
-cargo build --release
-CODESIGN_IDENTITY=macwifi-dev ./scripts/bundle.sh   # or without CODESIGN_IDENTITY
-cp -R target/release/macwifi.app /Applications/
+CODESIGN_IDENTITY=macwifi-dev ./scripts/reinstall.sh   # or without CODESIGN_IDENTITY for ad-hoc
 ```
 
-The daemon will be restarted automatically by the LaunchAgent's `KeepAlive`
-policy once the old process exits. Or restart it manually:
+> **Why the script instead of `cp`?** Copying a signed `.app` with `cp -R`
+> corrupts its signature; macOS then SIGKILLs the binary on every launch
+> (`Killed: 9` / exit 137) and the daemon silently fails to start. The script
+> uses `ditto` and re-signs in place, then verifies the result launches before
+> bootstrapping.
 
-```sh
-launchctl kickstart -k gui/$(id -u)/dev.macwifi.daemon
-```
-
-> **Note on Keychain grants and rebuilding:** If you used a stable
-> `CODESIGN_IDENTITY`, the CDHash doesn't change between builds signed with the
-> same certificate, so Keychain "Always Allow" grants survive rebuilds. With
-> ad-hoc signing (`-`), every build gets a new hash and grants are lost.
+> **Keychain cache and rebuilding:** with a stable `CODESIGN_IDENTITY`, the
+> signature is identical across builds, so macwifi's cached Wi-Fi passwords (and
+> the Location grant) survive rebuilds. With ad-hoc signing (`-`), every build
+> gets a new signature and you re-enter passwords + re-grant Location.
 
 ---
 
@@ -204,6 +210,14 @@ Remove the app, symlink, and config:
 rm -rf /Applications/macwifi.app
 rm -f /usr/local/bin/macwifi
 rm -rf ~/.config/macwifi
+```
+
+macwifi's cached Wi-Fi passwords live in your login keychain under the service
+name `macwifi-wifi`. `Forget` removes them per-network; to clear them all at
+once:
+
+```sh
+while security delete-generic-password -s macwifi-wifi >/dev/null 2>&1; do :; done
 ```
 
 ---
@@ -262,6 +276,37 @@ Run `macwifi themes` for the full list of available theme names.
 
 ---
 
+## Passwords & prompts
+
+macOS stores Wi-Fi passwords in the root-owned **System keychain**, where each
+item is guarded by a partition-list ACL that `securityd` enforces by the
+caller's *code signature*, not its uid. A third-party app like macwifi can't
+read those items silently — and neither can a root helper (verified: the read
+fails with `errSecAuthFailed` even as root). So macwifi never relies on reading
+the System keychain for everyday use:
+
+- **Connecting / reconnecting / forgetting / power / scan** — all go through
+  CoreWLAN and `networksetup`, where the system's own `wifid` handles any
+  credential lookup. **Silent, no prompts.**
+- **First connect to a secured network** — you type the password once. macwifi
+  associates *and* caches that password in its **own** login-keychain item
+  (`service=macwifi-wifi`), which it can read back silently because it owns the
+  item under its stable signing identity.
+- **Reconnecting to a saved network** — macwifi reads its cached password and
+  reconnects with no prompt. If there's no cache (e.g. a network saved outside
+  macwifi), it tries the system auto-join, and only asks for the password if
+  that fails.
+- **QR-share** — the one exception. It reads the password from the *System*
+  keychain, which triggers **one admin-auth dialog per share**. Unavoidable for
+  any third-party app.
+
+This means macwifi keeps a second, app-scoped copy of each password you connect
+with (in your login keychain). `Forget` deletes both the saved network and
+macwifi's cached copy. The full rationale — and why the earlier "root keychain
+helper" design was abandoned — is in `ARCHITECTURE_PASSWORDS.md`.
+
+---
+
 ## Architecture
 
 ```
@@ -310,11 +355,20 @@ cat /tmp/macwifi-daemon.err.log
 macwifi uninstall-daemon && macwifi install-daemon
 ```
 
-**Keychain password prompt on every connect**
+**Asked for the password every time you reconnect to a saved network**
 
-Either you haven't clicked "Always Allow" yet, or the app's code-signing
-identity changed (ad-hoc rebuild). To fix permanently, create the self-signed
-certificate (step 2 above) and rebuild with `CODESIGN_IDENTITY=macwifi-dev`.
+macwifi's cache can't be read silently — usually because the code-signing
+identity changed (an ad-hoc rebuild, or a different `CODESIGN_IDENTITY`), which
+invalidates the ACL on the cached items. Fix it by always rebuilding with the
+same cert: `CODESIGN_IDENTITY=macwifi-dev ./scripts/reinstall.sh`. You'll
+re-enter each password once more, after which reconnects are silent again.
+
+**Admin-password dialog when sharing a QR code**
+
+Expected. QR-share reads the password from the *System* keychain, which macOS
+guards with an admin-auth prompt for any third-party app — there is no silent
+path (not even as root). Enter your login password to continue, or cancel to
+share the SSID without the password. See `ARCHITECTURE_PASSWORDS.md` for why.
 
 **Full diagnostics**
 

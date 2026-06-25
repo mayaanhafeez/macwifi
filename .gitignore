@@ -20,4 +20,7 @@
 # Logs / local runtime
 *.log
 
+# AI
+.claude/
 # Note: Cargo.lock is committed on purpose (macwifi is a binary, not a library).
+

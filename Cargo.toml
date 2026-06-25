@@ -71,9 +71,6 @@ objc2-core-foundation = { version = "0.3", features = ["CFRunLoop"] }
 # Allow" grant then attaches to our app's code-signing identity (so it
 # persists across runs) rather than to the system `security` binary.
 security-framework = "3"
-# Raw CoreFoundation types for the deprecated SecKeychain ACL APIs we FFI in
-# `keychain_grant.rs` (not exposed by the `security-framework` crate).
-core-foundation-sys = "0.8"
 
 [profile.release]
 strip = true

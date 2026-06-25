@@ -218,8 +218,8 @@ impl App {
             Event::Error(s) => self.notifications.push(Notification::error(s)),
             Event::ShareReady(p) => self.overlay = Overlay::Share(p),
             Event::JoinSavedFailed { ssid, reason } => {
-                self.notifications.push(Notification::error(format!(
-                    "{ssid}: keychain read denied — enter password ({reason})"
+                self.notifications.push(Notification::info(format!(
+                    "{ssid}: enter password to connect ({reason})"
                 )));
                 self.overlay = Overlay::Password(PasswordPrompt {
                     ssid,
