@@ -31,7 +31,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_known_networks(f, chunks[0], app);
     draw_new_networks(f, chunks[1], app);
     draw_device(f, chunks[2], app);
-    draw_help(f, chunks[3], app.focus);
+    draw_help(f, chunks[3], app.focus, app.theme);
     draw_notifications(f, area, &app.notifications, app.theme);
 
     let theme = app.theme;
@@ -60,33 +60,40 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 //
 fn draw_known_networks(f: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.focus == Focus::Preferred;
+    let theme = app.theme;
     let connected = app.state.as_ref().and_then(|s| s.ssid.clone());
 
-    let visible = app.visible_preferred().to_vec();
+    let visible = app.visible_preferred();
     let rows: Vec<Row> = visible
         .iter()
         .map(|ssid| {
             let net = app.networks.iter().find(|n| n.ssid.as_deref() == Some(ssid));
-            let security = net
-                .map(|n| sec_label(n.security).to_string())
-                .unwrap_or_else(|| "-".into());
-            let signal = match net {
-                Some(n) => format!("{}%", signal_pct(n.rssi)),
-                None => "-".into(),
-            };
             let icon = if connected.as_deref() == Some(ssid) {
                 "󰖩 "
             } else {
                 ""
             };
-            Row::new(vec![
-                Line::from(icon).centered(),
-                Line::from(ssid.clone()).centered(),
-                Line::from(security).centered(),
-                Line::from("No").centered(),
-                Line::from("Yes").centered(),
-                Line::from(signal).centered(),
-            ])
+            // impala parity: out-of-range known networks (no scan match, only
+            // shown via the `A` toggle) render dimmed with blank detail columns.
+            match net {
+                Some(n) => Row::new(vec![
+                    Line::from(icon).centered(),
+                    Line::from(ssid.clone()).centered(),
+                    Line::from(sec_label(n.security).to_string()).centered(),
+                    Line::from("No").centered(),
+                    Line::from("Yes").centered(),
+                    Line::from(format!("{}%", signal_pct(n.rssi))).centered(),
+                ]),
+                None => Row::new(vec![
+                    Line::from(icon).centered(),
+                    Line::from(ssid.clone()).centered(),
+                    Line::from("").centered(),
+                    Line::from("").centered(),
+                    Line::from("").centered(),
+                    Line::from("").centered(),
+                ])
+                .dark_gray(),
+            }
         })
         .collect();
 
@@ -102,13 +109,13 @@ fn draw_known_networks(f: &mut Frame, area: Rect, app: &mut App) {
     let header = if focused {
         Row::new(vec![
             Line::from(""),
-            Line::from("Name").yellow().centered(),
-            Line::from("Security").yellow().centered(),
-            Line::from("Hidden").yellow().centered(),
-            Line::from("Auto Connect").yellow().centered(),
-            Line::from("Signal").yellow().centered(),
+            Line::from("Name").centered(),
+            Line::from("Security").centered(),
+            Line::from("Hidden").centered(),
+            Line::from("Auto Connect").centered(),
+            Line::from("Signal").centered(),
         ])
-        .style(Style::new().bold())
+        .style(Style::new().fg(theme.accent).bold())
         .bottom_margin(1)
     } else {
         Row::new(vec![
@@ -124,10 +131,10 @@ fn draw_known_networks(f: &mut Frame, area: Rect, app: &mut App) {
 
     let table = Table::new(rows, widths)
         .header(header)
-        .block(block(" Known Networks ", focused))
+        .block(block(" Known Networks ", focused, theme))
         .column_spacing(1)
         .flex(Flex::SpaceAround)
-        .row_highlight_style(highlight(focused));
+        .row_highlight_style(highlight(focused, theme));
 
     f.render_stateful_widget(table, area, &mut app.preferred_state);
 }
@@ -137,6 +144,7 @@ fn draw_known_networks(f: &mut Frame, area: Rect, app: &mut App) {
 //
 fn draw_new_networks(f: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.focus == Focus::Available;
+    let theme = app.theme;
 
     let visible = app.visible_networks();
     let rows: Vec<Row> = visible
@@ -161,11 +169,11 @@ fn draw_new_networks(f: &mut Frame, area: Rect, app: &mut App) {
 
     let header = if focused {
         Row::new(vec![
-            Line::from("Name").yellow().centered(),
-            Line::from("Security").yellow().centered(),
-            Line::from("Signal").yellow().centered(),
+            Line::from("Name").centered(),
+            Line::from("Security").centered(),
+            Line::from("Signal").centered(),
         ])
-        .style(Style::new().bold())
+        .style(Style::new().fg(theme.accent).bold())
         .bottom_margin(1)
     } else {
         Row::new(vec![
@@ -178,10 +186,10 @@ fn draw_new_networks(f: &mut Frame, area: Rect, app: &mut App) {
 
     let table = Table::new(rows, widths)
         .header(header)
-        .block(block(" New Networks ", focused))
+        .block(block(" New Networks ", focused, theme))
         .column_spacing(1)
         .flex(Flex::SpaceAround)
-        .row_highlight_style(highlight(focused));
+        .row_highlight_style(highlight(focused, theme));
 
     f.render_stateful_widget(table, area, &mut app.available_state);
 }
@@ -242,7 +250,7 @@ fn draw_device(f: &mut Frame, area: Rect, app: &App) {
 
     let table = Table::new(vec![row], widths)
         .header(header)
-        .block(block(" Device ", false))
+        .block(block(" Device ", false, app.theme))
         .column_spacing(1)
         .flex(Flex::SpaceAround);
 
@@ -250,7 +258,7 @@ fn draw_device(f: &mut Frame, area: Rect, app: &App) {
     f.render_stateful_widget(table, area, &mut state);
 }
 
-fn draw_help(f: &mut Frame, area: Rect, focus: Focus) {
+fn draw_help(f: &mut Frame, area: Rect, focus: Focus, theme: Theme) {
     let lines = match focus {
         Focus::Preferred => vec![
             Line::from(vec![
@@ -336,25 +344,28 @@ fn draw_help(f: &mut Frame, area: Rect, focus: Focus) {
             ]),
         ],
     };
-    f.render_widget(Paragraph::new(lines).centered().blue(), area);
+    f.render_widget(
+        Paragraph::new(lines).centered().fg(theme.accent),
+        area,
+    );
 }
 
 //
-// Shared impala-style block / styling helpers (hardcoded colors, like impala).
+// Shared impala-style block / styling helpers, tinted by the active theme.
 //
-fn block(title: &'static str, focused: bool) -> Block<'static> {
+fn block(title: &'static str, focused: bool, theme: Theme) -> Block<'static> {
     Block::default()
         .title(title)
         .title_style(if focused {
-            Style::default().bold()
+            Style::default().fg(theme.title).bold()
         } else {
-            Style::default()
+            Style::default().fg(theme.title)
         })
         .borders(Borders::ALL)
         .border_style(if focused {
-            Style::default().fg(Color::Green)
+            Style::default().fg(theme.border_focused)
         } else {
-            Style::default()
+            Style::default().fg(theme.border)
         })
         .border_type(if focused {
             BorderType::Thick
@@ -364,9 +375,9 @@ fn block(title: &'static str, focused: bool) -> Block<'static> {
         .padding(Padding::horizontal(1))
 }
 
-fn highlight(focused: bool) -> Style {
+fn highlight(focused: bool, theme: Theme) -> Style {
     if focused {
-        Style::default().bg(Color::DarkGray).fg(Color::White)
+        Style::default().bg(theme.accent).fg(theme.accent_fg)
     } else {
         Style::default()
     }

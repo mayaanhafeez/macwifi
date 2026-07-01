@@ -14,7 +14,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 
 fn handle_global(app: &mut App, key: KeyEvent) {
     match (key.code, key.modifiers) {
-        (KeyCode::Char('q'), KeyModifiers::NONE) | (KeyCode::Esc, _) => app.quit(),
+        (KeyCode::Char('q'), KeyModifiers::NONE) => app.quit(),
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => app.quit(),
         (KeyCode::Tab, _) => app.toggle_focus(),
         (KeyCode::Char('j'), _) | (KeyCode::Down, _) => app.move_selection(1),
@@ -27,7 +27,7 @@ fn handle_global(app: &mut App, key: KeyEvent) {
         (KeyCode::Char('x'), _) => app.wifi.send(Request::Disconnect),
         (KeyCode::Char('d'), _) => {
             if app.focus == Focus::Preferred {
-                if let Some(ssid) = app.selected_preferred().cloned() {
+                if let Some(ssid) = app.selected_preferred() {
                     app.wifi.send(Request::Forget(ssid));
                 }
             }

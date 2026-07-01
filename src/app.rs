@@ -40,12 +40,6 @@ pub struct HiddenPrompt {
     pub input: Input,
 }
 
-/// Cap on Preferred rows shown by default. macOS keeps every SSID you've
-/// ever joined; `networksetup -listpreferredwirelessnetworks` returns them
-/// in priority order, which is roughly recency, so the head of the list is
-/// almost always what the user wants. `A` toggles to the full list.
-pub const PREFERRED_DEFAULT_LIMIT: usize = 10;
-
 pub struct App {
     pub running: bool,
     pub focus: Focus,
@@ -127,7 +121,7 @@ impl App {
     pub fn toggle_show_all_preferred(&mut self) {
         self.show_all_preferred = !self.show_all_preferred;
         self.notifications.push(Notification::info(format!(
-            "all preferred: {}",
+            "show unavailable known: {}",
             if self.show_all_preferred { "on" } else { "off" }
         )));
         let len = self.visible_preferred().len();
@@ -156,12 +150,33 @@ impl App {
         });
     }
 
-    pub fn visible_preferred(&self) -> &[String] {
-        if self.show_all_preferred || self.preferred.len() <= PREFERRED_DEFAULT_LIMIT {
-            &self.preferred
-        } else {
-            &self.preferred[..PREFERRED_DEFAULT_LIMIT]
+    /// True when `ssid` shows up in the latest scan, i.e. it's in range.
+    fn is_in_range(&self, ssid: &str) -> bool {
+        self.networks
+            .iter()
+            .any(|n| n.ssid.as_deref() == Some(ssid))
+    }
+
+    /// impala parity: the Known Networks table lists only known networks that
+    /// are currently in range. `show_all_preferred` (the `A` toggle) appends
+    /// the out-of-range remembered networks after them. `preferred` is already
+    /// sorted strongest-signal-first, so the in-range ones come out ordered.
+    pub fn visible_preferred(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .preferred
+            .iter()
+            .filter(|ssid| self.is_in_range(ssid))
+            .cloned()
+            .collect();
+        if self.show_all_preferred {
+            out.extend(
+                self.preferred
+                    .iter()
+                    .filter(|ssid| !self.is_in_range(ssid))
+                    .cloned(),
+            );
         }
+        out
     }
 
     pub fn visible_networks(&self) -> Vec<&ScannedNetwork> {
@@ -203,6 +218,14 @@ impl App {
                 } else if self.available_state.selected().map_or(true, |i| i >= len) {
                     self.available_state.select(Some(0));
                 }
+                // The Known Networks list is filtered by what's in range, so it
+                // shifts with each scan — re-clamp its selection too.
+                let plen = self.visible_preferred().len();
+                if plen == 0 {
+                    self.preferred_state.select(None);
+                } else if self.preferred_state.selected().map_or(true, |i| i >= plen) {
+                    self.preferred_state.select(Some(0));
+                }
             }
             Event::PreferredResult(v) => {
                 self.preferred = v;
@@ -235,9 +258,9 @@ impl App {
         self.visible_networks().get(i).copied()
     }
 
-    pub fn selected_preferred(&self) -> Option<&String> {
+    pub fn selected_preferred(&self) -> Option<String> {
         let i = self.preferred_state.selected()?;
-        self.visible_preferred().get(i)
+        self.visible_preferred().into_iter().nth(i)
     }
 
     pub fn move_selection(&mut self, delta: isize) {
@@ -303,7 +326,7 @@ impl App {
     }
 
     pub fn connect_selected_preferred(&mut self) {
-        let Some(ssid) = self.selected_preferred().cloned() else {
+        let Some(ssid) = self.selected_preferred() else {
             return;
         };
         // Saved networks already have their credentials in Keychain; route
@@ -324,7 +347,7 @@ impl App {
     }
 
     pub fn share_selected_preferred(&mut self) {
-        let Some(ssid) = self.selected_preferred().cloned() else {
+        let Some(ssid) = self.selected_preferred() else {
             return;
         };
         let Some(security) = self.security_for(&ssid) else {

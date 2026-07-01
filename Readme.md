@@ -24,9 +24,10 @@ Station mode only. Theming, hidden networks, QR sharing, adapter info, and a
 
 ![macwifi TUI showing the Known Networks, New Networks, and Device tables over a desktop wallpaper](images/demo.png)
 
-Three stacked tables — **Known Networks** (saved profiles), **New Networks**
-(in-range scan results), and **Device** (current interface) — both network
-lists sorted strongest-signal-first.
+Three stacked tables — **Known Networks** (in-range saved profiles; press `A`
+to also list out-of-range ones), **New Networks** (in-range scan results), and
+**Device** (current interface) — both network lists sorted
+strongest-signal-first.
 
 ---
 
@@ -237,10 +238,11 @@ while security delete-generic-password -s macwifi-wifi >/dev/null 2>&1; do :; do
 | `h` | Connect to a hidden network (New Networks) |
 | `i` | Adapter info popup |
 | `a` | Show all networks — disable RSSI/SSID filter (New Networks) |
-| `A` | Show full saved-network list — default: top 10 (Known Networks) |
+| `A` | Also show out-of-range saved networks — default: in-range only (Known Networks) |
 | `T` | Cycle theme forward |
 | `Shift-Tab` | Cycle theme backward |
-| `q` / `Esc` / `Ctrl-C` | Quit (or dismiss overlay) |
+| `q` / `Ctrl-C` | Quit |
+| `Esc` | Dismiss the current overlay |
 
 Non-interactive subcommands for scripting:
 
