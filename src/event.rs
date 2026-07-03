@@ -32,8 +32,28 @@ pub enum Event {
     Notice(String),
     Error(String),
     ShareReady(SharePayload),
-    JoinSavedFailed { ssid: String, reason: String },
+    JoinSavedFailed {
+        ssid: String,
+        reason: JoinFailReason,
+        detail: String,
+    },
     DaemonDiagnose(DaemonDiagnose),
+}
+
+/// Why a `JoinSaved` reconnect could not complete. The client uses this to
+/// decide whether to re-prompt for a password (`NoCachedCredential`,
+/// `KeychainDenied`, `AssociationFailed`) or just show a toast (`NotInRange`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JoinFailReason {
+    /// The network isn't in the latest scan — out of range or radio off.
+    NotInRange,
+    /// No macwifi-cached password exists for this network yet.
+    NoCachedCredential,
+    /// A cached item exists but couldn't be read (stale ACL, etc.).
+    KeychainDenied,
+    /// We had a credential but the association / verification didn't take.
+    AssociationFailed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

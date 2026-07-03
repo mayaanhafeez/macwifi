@@ -9,9 +9,9 @@ use std::thread;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::corewlan::{WifiClient, WifiInterface};
-use crate::event::{Event, SharePayload};
-use crate::{keychain, networksetup};
+use crate::corewlan::{Security, WifiClient, WifiInterface};
+use crate::event::{Event, JoinFailReason, SharePayload};
+use crate::{dlog, keychain, networksetup};
 
 /// Operations the worker can be asked to perform. Serializable so the same
 /// type travels over the daemon's unix socket and through the in-process
@@ -171,53 +171,58 @@ fn worker_loop(rx: std_mpsc::Receiver<Request>, events: UnboundedSender<Event>) 
             Request::JoinWithPassword { ssid, password } => {
                 let name = iface.name();
                 match networksetup::set_airport_network(&name, &ssid, Some(&password)) {
-                    Ok(()) if verify_join(&iface, &ssid) => {
-                        // Cache our own copy so future reconnects are silent.
-                        // Best-effort: a cache miss just means we prompt again.
-                        if let Err(e) = keychain::cache_password(&ssid, &password) {
-                            eprintln!("warning: could not cache password for {ssid}: {e}");
-                        }
-                        let _ = events.send(Event::Notice(format!("connected to {ssid}")));
-                    }
                     Ok(()) => {
-                        let _ = events.send(Event::Error(format!(
-                            "join to {ssid} did not take effect — check the password"
-                        )));
+                        // Cache our own copy as soon as networksetup accepts the
+                        // password — do NOT gate this on verify_join. Association
+                        // + DHCP can lag the command's return by several seconds,
+                        // and a slow-but-successful join used to leave nothing
+                        // cached, forcing another prompt next time. A genuinely
+                        // wrong password self-corrects: the next JoinSaved fails
+                        // with AssociationFailed and re-prompts, overwriting this.
+                        if let Err(e) = keychain::cache_password(&ssid, &password) {
+                            dlog!("cache_password({ssid}) failed: {e:#}");
+                        } else {
+                            dlog!("cached password for {ssid}");
+                        }
+                        if verify_join(&iface, &ssid) {
+                            let _ = events.send(Event::Notice(format!("connected to {ssid}")));
+                        } else {
+                            dlog!("join to {ssid}: networksetup ok but association unconfirmed");
+                            let _ = events.send(Event::Notice(format!(
+                                "join to {ssid} sent — association not yet confirmed, it may still complete"
+                            )));
+                        }
                     }
                     Err(e) => {
+                        dlog!("join to {ssid} failed: {e:#}");
                         let _ = events.send(Event::Error(format!("join failed: {e}")));
                     }
                 }
                 emit_state(&iface, &events);
             }
             Request::JoinSaved(ssid) => {
-                // Silent-reconnect strategy, cheapest first:
-                //   1. If macwifi has cached this network's password in the login
-                //      keychain (from a prior connect), read it back silently and
-                //      associate with it. This is the only reliable silent path
-                //      for secured networks — the System keychain's copy is walled
-                //      off by a partition-list ACL even from root (the -25308/
-                //      -25293 finding; see keychain.rs).
-                //   2. Otherwise try CoreWLAN's `associateToNetwork:password:nil`,
-                //      which works for open networks and any secured network whose
-                //      credential wifid can supply internally.
-                //   3. If neither connects, ask the user for the password. We do
-                //      NOT read the System keychain here — it fires a useless admin
-                //      dialog and fails anyway.
-                let joined = match keychain::cached_password(&ssid) {
-                    Ok(Some(pw)) => {
-                        iface.associate_psk(&ssid, &pw).is_ok() && verify_join(&iface, &ssid)
+                // Silent-reconnect strategy. Each failure is classified so the
+                // client can decide whether to re-prompt for a password (a real
+                // credential problem) or just show a toast (network simply out of
+                // range). We deliberately do NOT read the System keychain here —
+                // its AirPort item is walled off by a partition-list ACL even from
+                // root (the -25293 finding; see keychain.rs) so it would only fire
+                // a useless admin dialog. macwifi's own login-keychain cache is the
+                // only silent path for secured networks.
+                let outcome = join_saved(&iface, &ssid);
+                match outcome {
+                    Ok(()) => {
+                        dlog!("reconnected to {ssid}");
+                        let _ = events.send(Event::Notice(format!("connected to {ssid}")));
                     }
-                    _ => false,
-                } || (iface.associate_open(&ssid).is_ok() && verify_join(&iface, &ssid));
-
-                if joined {
-                    let _ = events.send(Event::Notice(format!("connected to {ssid}")));
-                } else {
-                    let _ = events.send(Event::JoinSavedFailed {
-                        ssid,
-                        reason: "saved credential unavailable".into(),
-                    });
+                    Err((reason, detail)) => {
+                        dlog!("JoinSaved({ssid}) failed: {reason:?} — {detail}");
+                        let _ = events.send(Event::JoinSavedFailed {
+                            ssid,
+                            reason,
+                            detail,
+                        });
+                    }
                 }
                 emit_state(&iface, &events);
             }
@@ -327,14 +332,71 @@ fn emit_state(iface: &WifiInterface, events: &UnboundedSender<Event>) {
     }
 }
 
+/// Try to silently reconnect to a saved network. Returns the specific reason on
+/// failure so the client can react appropriately (re-prompt vs. toast). Never
+/// falls back to a blind `associate_open` on a secured network: CoreWLAN's
+/// nil-password associate does not consult saved credentials, so it can't help
+/// and may tear down an association we just started.
+fn join_saved(iface: &WifiInterface, ssid: &str) -> Result<(), (JoinFailReason, String)> {
+    // Is it even in range? A directed scan is the authoritative check and also
+    // tells us the security type. `find_network`-style empty result ⇒ out of
+    // range, which is not a credential problem.
+    let scan = iface.scan_for_ssid(ssid).map_err(|e| {
+        (
+            JoinFailReason::NotInRange,
+            format!("directed scan failed: {e}"),
+        )
+    })?;
+    let net = scan.into_iter().next().ok_or_else(|| {
+        (
+            JoinFailReason::NotInRange,
+            "network not visible in scan".to_string(),
+        )
+    })?;
+
+    // Open networks need no credential.
+    if net.security == Security::Open {
+        return if iface.associate_open(ssid).is_ok() && verify_join(iface, ssid) {
+            Ok(())
+        } else {
+            Err((
+                JoinFailReason::AssociationFailed,
+                "open associate did not take effect".to_string(),
+            ))
+        };
+    }
+
+    // Secured: use macwifi's own cached password if we have one.
+    match keychain::cached_password(ssid) {
+        Ok(Some(pw)) => {
+            if iface.associate_psk(ssid, &pw).is_ok() && verify_join(iface, ssid) {
+                Ok(())
+            } else {
+                Err((
+                    JoinFailReason::AssociationFailed,
+                    "cached password did not associate".to_string(),
+                ))
+            }
+        }
+        Ok(None) => Err((
+            JoinFailReason::NoCachedCredential,
+            "no saved credential in macwifi cache".to_string(),
+        )),
+        // cached_password already deleted the poisoned item; a re-entered
+        // password will recreate it cleanly.
+        Err(e) => Err((JoinFailReason::KeychainDenied, format!("{e:#}"))),
+    }
+}
+
 /// Confirm a `networksetup`-driven join actually took effect, independent of
 /// locale. `networksetup -setairportnetwork` exits 0 and prints a *localized*
 /// "Failed…" line on auth/password errors, so the only trustworthy signal is
-/// reading back the interface's current SSID via CoreWLAN. Association can lag
-/// the command's return by a moment, so poll briefly. (The daemon holds the
-/// Location grant, so the SSID readback isn't redacted here.)
+/// reading back the interface's current SSID via CoreWLAN. Association + DHCP
+/// can lag the command's return by several seconds, so poll for up to 10s. This
+/// early-exits on success, so a fast join returns immediately. (The daemon holds
+/// the Location grant, so the SSID readback isn't redacted here.)
 fn verify_join(iface: &WifiInterface, ssid: &str) -> bool {
-    for _ in 0..6 {
+    for _ in 0..20 {
         if let Ok(st) = iface.state() {
             if st.ssid.as_deref() == Some(ssid) {
                 return true;

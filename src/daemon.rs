@@ -22,6 +22,8 @@ use crate::ipc::{self, Hello, Reader, Writer};
 use crate::worker::{LocalWifiHandle, Request};
 
 pub async fn run() -> Result<()> {
+    crate::logging::init();
+    crate::dlog!("daemon starting (build {})", ipc::BUILD_ID);
     let path = ipc::socket_path();
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
@@ -34,7 +36,7 @@ pub async fn run() -> Result<()> {
         .with_context(|| format!("bind {}", path.display()))?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod 0600 {}", path.display()))?;
-    eprintln!("macwifi-daemon listening at {}", path.display());
+    crate::dlog!("listening at {}", path.display());
 
     // Fire Location prompt + start the CFRunLoop pump. Runs forever on a
     // background thread; we need it both for TCC and for CoreWLAN's
@@ -65,7 +67,7 @@ pub async fn run() -> Result<()> {
         let fanout = fanout.clone();
         tokio::spawn(async move {
             if let Err(e) = serve_one(stream, wifi, fanout).await {
-                eprintln!("client task ended: {e:#}");
+                crate::dlog!("client task ended: {e:#}");
             }
         });
     }
@@ -89,6 +91,7 @@ async fn serve_one(
         &mut writer,
         &Hello {
             version: ipc::PROTOCOL_VERSION,
+            build: ipc::BUILD_ID.to_string(),
         },
     )
     .await?;
@@ -109,7 +112,7 @@ async fn serve_one(
     let writer_task = tokio::spawn(async move {
         while let Some(ev) = client_rx.recv().await {
             if let Err(e) = ipc::write_line(&mut writer, &ev).await {
-                eprintln!("daemon writer: {e:#}");
+                crate::dlog!("daemon writer: {e:#}");
                 break;
             }
         }

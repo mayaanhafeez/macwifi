@@ -16,6 +16,7 @@ pub mod install;
 pub mod ipc;
 pub mod keychain;
 pub mod location;
+pub mod logging;
 pub mod networksetup;
 pub mod notification;
 pub mod terminal;

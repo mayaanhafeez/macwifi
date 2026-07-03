@@ -43,8 +43,13 @@ pub fn wifi_password(ssid: &str) -> Result<String> {
 }
 
 /// Store macwifi's own copy of `ssid`'s password in the login keychain so future
-/// reconnects can read it back silently. Add-or-update; safe to call repeatedly.
+/// reconnects can read it back silently. Delete-then-add rather than update:
+/// updating an existing item keeps its original ACL, which is bound to the code
+/// identity of whichever build *created* it — so an item created by an old build
+/// stays unreadable forever no matter how many times we "update" it. Recreating
+/// rebinds the ACL to the current binary. Safe to call repeatedly.
 pub fn cache_password(ssid: &str, password: &str) -> Result<()> {
+    let _ = delete_generic_password(CACHE_SERVICE, ssid);
     set_generic_password(CACHE_SERVICE, ssid, password.as_bytes())
         .with_context(|| format!("cache password for {ssid}"))
 }
@@ -52,11 +57,19 @@ pub fn cache_password(ssid: &str, password: &str) -> Result<()> {
 /// Read macwifi's cached password for `ssid` from the login keychain. Returns
 /// `Ok(None)` if we've never cached one (a network saved outside macwifi). This
 /// read is silent — macwifi owns the item under its own code identity.
+///
+/// Any other error means the item exists but this build can't use it (typically
+/// an ACL bound to a previous build's signature). The item is useless and
+/// unrepairable-in-place, so delete it: the next successful password entry
+/// recreates it under the current identity and reads go back to being silent.
 pub fn cached_password(ssid: &str) -> Result<Option<String>> {
     match get_generic_password(CACHE_SERVICE, ssid) {
         Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
         Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("cached password lookup for {ssid}")),
+        Err(e) => {
+            let _ = delete_generic_password(CACHE_SERVICE, ssid);
+            Err(e).with_context(|| format!("cached password lookup for {ssid}"))
+        }
     }
 }
 

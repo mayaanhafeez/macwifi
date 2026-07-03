@@ -68,7 +68,7 @@ impl RemoteWifiHandle {
         let path = ipc::socket_path();
         // First connection is synchronous so startup failures surface to the
         // caller (e.g. "daemon unreachable — run `macwifi install-daemon`").
-        let conn = connect_with_retry(&path).await?;
+        let conn = connect_with_retry(&path, &events).await?;
 
         let (req_tx, req_rx) = mpsc::unbounded_channel::<Request>();
         tokio::spawn(supervise(path, conn, req_rx, events, auto_init, reconnect));
@@ -116,7 +116,7 @@ async fn supervise(
                 let _ = events.send(Event::Notice(
                     "daemon connection lost — reconnecting…".into(),
                 ));
-                match connect_with_retry(&path).await {
+                match connect_with_retry(&path, &events).await {
                     Ok(c) => conn = c,
                     Err(e) => {
                         let _ = events.send(Event::Error(format!(
@@ -199,7 +199,9 @@ async fn send_init(write_half: &mut ipc::Writer) {
 }
 
 /// One connect attempt: open the socket and complete the version handshake.
-async fn establish(path: &Path) -> Result<Conn> {
+/// Emits a `Notice` if the daemon reports a different build than this client —
+/// the usual symptom of a stale daemon left running after a rebuild.
+async fn establish(path: &Path, events: &UnboundedSender<Event>) -> Result<Conn> {
     let stream = UnixStream::connect(path).await?;
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -210,15 +212,24 @@ async fn establish(path: &Path) -> Result<Conn> {
         server_hello.ok_or_else(|| anyhow::anyhow!("daemon closed before hello"))?;
     if server_hello.version != ipc::PROTOCOL_VERSION {
         bail!(
-            "protocol version mismatch (server {}, client {})",
+            "protocol version mismatch (server {}, client {}) — the daemon is a \
+             stale build; run scripts/reinstall.sh",
             server_hello.version,
             ipc::PROTOCOL_VERSION
         );
+    }
+    if !server_hello.build.is_empty() && server_hello.build != ipc::BUILD_ID {
+        let _ = events.send(Event::Notice(format!(
+            "daemon is running build {}, client is {} — run scripts/reinstall.sh to update",
+            server_hello.build,
+            ipc::BUILD_ID
+        )));
     }
     ipc::write_line(
         &mut write_half,
         &Hello {
             version: ipc::PROTOCOL_VERSION,
+            build: ipc::BUILD_ID.to_string(),
         },
     )
     .await?;
@@ -227,10 +238,10 @@ async fn establish(path: &Path) -> Result<Conn> {
 }
 
 /// Connect with brief retry to cover the launchd-restart window.
-async fn connect_with_retry(path: &Path) -> Result<Conn> {
+async fn connect_with_retry(path: &Path, events: &UnboundedSender<Event>) -> Result<Conn> {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..20 {
-        match establish(path).await {
+        match establish(path, events).await {
             Ok(conn) => return Ok(conn),
             Err(e) => {
                 last_err = Some(e.context(format!(

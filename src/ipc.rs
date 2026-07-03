@@ -11,11 +11,18 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Build identifier baked in at compile time (see `build.rs`): short git hash +
+/// build timestamp. Compared across the handshake so a stale daemon left running
+/// after a rebuild can be surfaced to the user.
+pub const BUILD_ID: &str = env!("MACWIFI_BUILD_ID");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hello {
     pub version: u32,
+    #[serde(default)]
+    pub build: String,
 }
 
 /// Default location for the daemon's accept socket. Per-user, mode 0600. The

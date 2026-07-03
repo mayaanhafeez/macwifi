@@ -2,7 +2,7 @@ use ratatui::widgets::TableState;
 use tui_input::Input;
 
 use crate::corewlan::{InterfaceState, ScannedNetwork, Security};
-use crate::event::{Event, SharePayload};
+use crate::event::{Event, JoinFailReason, SharePayload};
 use crate::notification::Notification;
 use crate::theme::{self, Theme};
 use crate::worker::{Associate, AssociateKind, Request, ShareSecurity, WifiHandle};
@@ -240,14 +240,30 @@ impl App {
             Event::Notice(s) => self.notifications.push(Notification::info(s)),
             Event::Error(s) => self.notifications.push(Notification::error(s)),
             Event::ShareReady(p) => self.overlay = Overlay::Share(p),
-            Event::JoinSavedFailed { ssid, reason } => {
-                self.notifications.push(Notification::info(format!(
-                    "{ssid}: enter password to connect ({reason})"
-                )));
-                self.overlay = Overlay::Password(PasswordPrompt {
-                    ssid,
-                    input: tui_input::Input::default(),
-                });
+            Event::JoinSavedFailed { ssid, reason, detail } => {
+                match reason {
+                    // Out of range isn't a credential problem — a password
+                    // prompt would be misleading. Just say so.
+                    JoinFailReason::NotInRange => {
+                        self.notifications.push(Notification::error(format!(
+                            "{ssid}: not in range ({detail})"
+                        )));
+                    }
+                    // A real credential problem: prompt once. If the cache was
+                    // poisoned it's already been cleared daemon-side, so the
+                    // password we're about to collect will be re-cached cleanly.
+                    JoinFailReason::NoCachedCredential
+                    | JoinFailReason::KeychainDenied
+                    | JoinFailReason::AssociationFailed => {
+                        self.notifications.push(Notification::info(format!(
+                            "{ssid}: enter password to connect ({detail})"
+                        )));
+                        self.overlay = Overlay::Password(PasswordPrompt {
+                            ssid,
+                            input: tui_input::Input::default(),
+                        });
+                    }
+                }
             }
             _ => {}
         }
