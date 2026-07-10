@@ -33,6 +33,32 @@ strongest-signal-first.
 
 ## Setup
 
+### Option A: Homebrew
+
+```sh
+brew install mayaanhafeez/tap/macwifi
+```
+
+This builds macwifi from source (cargo + the project's own bundling script),
+ad-hoc signs it, installs `macwifi.app` to `/Applications`, and registers the
+LaunchAgent daemon automatically. On first launch, macOS will prompt for
+Location permission — click **Allow While Using App**.
+
+Ad-hoc signing means the signature isn't stable across rebuilds: if you
+reinstall/upgrade later, you'll be asked to re-grant Location and re-enter any
+saved Wi-Fi passwords once (see [Passwords & prompts](#passwords--prompts)).
+If that matters to you, use the manual setup below instead, which walks
+through creating a stable self-signed cert first.
+
+To uninstall: `brew uninstall --cask mayaanhafeez/tap/macwifi` (add `--zap` to
+also remove `~/.config/macwifi` and `~/Library/Application Support/macwifi`).
+
+### Option B: Manual setup
+
+Gives you full control over code signing (recommended if you want a stable
+identity so Keychain grants survive rebuilds) and matches how the project is
+developed day to day.
+
 ### 1. Prerequisites
 
 **macOS 13 Ventura or newer.** CoreWLAN's scan API requires Location Services,
