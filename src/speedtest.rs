@@ -36,10 +36,7 @@ impl std::fmt::Display for SpeedtestProvider {
 impl SpeedtestProvider {
     /// Provider-aware process ceiling used by the CLI when none is configured.
     pub fn default_timeout(self) -> Duration {
-        match self {
-            Self::Apple => Duration::from_secs(30),
-            Self::Ookla | Self::Netflix | Self::Custom => Duration::from_secs(300),
-        }
+        Duration::from_secs(300)
     }
 }
 
@@ -693,8 +690,8 @@ mod tests {
     }
 
     #[test]
-    fn slow_providers_have_longer_default_timeouts() {
-        assert_eq!(SpeedtestProvider::Apple.default_timeout().as_secs(), 30);
+    fn providers_allow_slow_connections_by_default() {
+        assert_eq!(SpeedtestProvider::Apple.default_timeout().as_secs(), 300);
         assert_eq!(SpeedtestProvider::Ookla.default_timeout().as_secs(), 300);
         assert_eq!(SpeedtestProvider::Netflix.default_timeout().as_secs(), 300);
     }

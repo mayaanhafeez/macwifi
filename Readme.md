@@ -344,11 +344,10 @@ macwifi speedtest --provider apple --format jsonl
 macwifi speedtest --provider custom --custom-command ./my-speedtest --custom-arg value
 ```
 
-Apple defaults to a 30-second measurement window, followed by up to five
-seconds for `networkQuality` to serialize its result. Ookla, Netflix, and
-custom providers default to a five-minute ceiling so browser startup and tests
-on slow connections can finish. Use `--timeout` to override the limit for one
-run.
+All providers default to a five-minute measurement window so tests on slow
+connections can finish. Apple allows up to five additional seconds for
+`networkQuality` to serialize its result. Use `--timeout` to override the limit
+for one run.
 
 #### Process API
 
