@@ -30,6 +30,8 @@ tokio = { version = "1", features = [
     "net",
     "io-util",
     "fs",
+    "process",
+    "signal",
 ] }
 tui-input = { version = "0.15", features = [
     "crossterm",

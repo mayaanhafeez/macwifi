@@ -1,5 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use std::io::{IsTerminal, Write};
+use std::path::PathBuf;
+use std::time::Duration;
 
 use macwifi::app::App;
 use macwifi::client::{RemoteWifiHandle, cli_one_shot};
@@ -7,6 +10,9 @@ use macwifi::config::Config;
 use macwifi::corewlan::Security;
 use macwifi::event::{Event, UiEvent, UiEventHandler};
 use macwifi::handler;
+use macwifi::speedtest::{
+    SpeedtestEvent, SpeedtestOptions, SpeedtestProvider, SpeedtestResult,
+};
 use macwifi::terminal::Tui;
 use macwifi::theme;
 use macwifi::ui;
@@ -50,6 +56,27 @@ enum Cmd {
     },
     Themes,
     Diagnose,
+    /// Measure download speed, upload speed, and latency.
+    Speedtest {
+        /// Test backend. Apple requires no additional installation.
+        #[arg(long, value_enum)]
+        provider: Option<SpeedtestProvider>,
+        /// Output format. JSONL streams progress and the final result.
+        #[arg(long, value_enum, default_value_t = SpeedtestOutput::Text)]
+        format: SpeedtestOutput,
+        /// Maximum test duration in seconds.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: Option<u64>,
+        /// Select a specific Ookla server.
+        #[arg(long)]
+        server_id: Option<u64>,
+        /// Executable that emits macwifi speed-test JSON (custom provider only).
+        #[arg(long)]
+        custom_command: Option<PathBuf>,
+        /// Argument passed to the custom executable. May be repeated.
+        #[arg(long)]
+        custom_arg: Vec<String>,
+    },
     /// Run the daemon (invoked by the LaunchAgent — not for end users).
     Daemon,
     /// Install the LaunchAgent so the daemon starts at login.
@@ -62,6 +89,23 @@ enum Cmd {
 enum PowerState {
     On,
     Off,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum SpeedtestOutput {
+    Text,
+    Json,
+    Jsonl,
+}
+
+impl std::fmt::Display for SpeedtestOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Text => "text",
+            Self::Json => "json",
+            Self::Jsonl => "jsonl",
+        })
+    }
 }
 
 fn main() -> Result<()> {
@@ -135,6 +179,46 @@ async fn drive(tui: &mut Tui, theme_name: Option<&str>) -> Result<()> {
 async fn run_cli(cmd: Cmd) -> Result<()> {
     match cmd {
         Cmd::Daemon => macwifi::daemon::run().await,
+        Cmd::Speedtest {
+            provider,
+            format,
+            timeout,
+            server_id,
+            custom_command,
+            custom_arg,
+        } => {
+            let cfg = Config::load()?.speedtest;
+            let provider = provider.unwrap_or(cfg.provider);
+            let timeout = timeout
+                .or(cfg.timeout_seconds)
+                .map(Duration::from_secs)
+                .unwrap_or_else(|| provider.default_timeout());
+            let options = SpeedtestOptions {
+                provider,
+                timeout,
+                server_id,
+                custom_command: custom_command.or(cfg.custom_command),
+                custom_args: if custom_arg.is_empty() {
+                    cfg.custom_args
+                } else {
+                    custom_arg
+                },
+            };
+            let live_terminal = std::io::stderr().is_terminal();
+            let result = macwifi::speedtest::run_with_progress(&options, |event| match format {
+                SpeedtestOutput::Text => render_speedtest_event(&event, live_terminal),
+                SpeedtestOutput::Json => {}
+                SpeedtestOutput::Jsonl => {
+                    if let Ok(line) = serde_json::to_string(&event) {
+                        println!("{line}");
+                        let _ = std::io::stdout().flush();
+                    }
+                }
+            })
+            .await?;
+            print_speedtest(&result, format)?;
+            Ok(())
+        }
         Cmd::Status => {
             let evs = cli_one_shot(Request::RefreshState, |e| matches!(e, Event::State(_))).await?;
             for ev in evs {
@@ -262,6 +346,80 @@ fn print_terminal_event(evs: &[Event]) {
             _ => {}
         }
     }
+}
+
+fn print_speedtest(result: &SpeedtestResult, format: SpeedtestOutput) -> Result<()> {
+    match format {
+        SpeedtestOutput::Json => {
+            println!("{}", serde_json::to_string(result)?);
+            return Ok(());
+        }
+        SpeedtestOutput::Jsonl => return Ok(()),
+        SpeedtestOutput::Text => {}
+    }
+
+    println!("provider : {}", result.provider);
+    println!("download : {}", metric(result.download_mbps, "Mbps"));
+    println!("upload   : {}", metric(result.upload_mbps, "Mbps"));
+    println!("ping     : {}", metric(result.ping_ms, "ms"));
+    if let Some(value) = result.jitter_ms {
+        println!("jitter   : {value:.2} ms");
+    }
+    if let Some(value) = result.packet_loss_percent {
+        println!("loss     : {value:.2}%");
+    }
+    if let Some(server) = &result.server {
+        let label = server
+            .name
+            .as_deref()
+            .or(server.host.as_deref())
+            .unwrap_or("-");
+        println!("server   : {label}");
+    }
+    Ok(())
+}
+
+fn render_speedtest_event(event: &SpeedtestEvent, live_terminal: bool) {
+    match event {
+        SpeedtestEvent::Started { provider, .. } if live_terminal => {
+            eprint!("\rTesting with {provider}... 0.0s");
+            let _ = std::io::stderr().flush();
+        }
+        SpeedtestEvent::Started { provider, .. } => eprintln!("Testing with {provider}..."),
+        SpeedtestEvent::Progress {
+            elapsed_ms,
+            download_mbps,
+            upload_mbps,
+            ping_ms,
+            ..
+        } if live_terminal => {
+            eprint!(
+                "\r\x1b[2KTesting... down {}  up {}  ping {}  {:.1}s",
+                live_metric(*download_mbps, "Mbps"),
+                live_metric(*upload_mbps, "Mbps"),
+                live_metric(*ping_ms, "ms"),
+                *elapsed_ms as f64 / 1000.0,
+            );
+            let _ = std::io::stderr().flush();
+        }
+        SpeedtestEvent::Complete { .. } | SpeedtestEvent::Failed { .. } if live_terminal => {
+            eprint!("\r\x1b[2K");
+            let _ = std::io::stderr().flush();
+        }
+        _ => {}
+    }
+}
+
+fn live_metric(value: Option<f64>, unit: &str) -> String {
+    value
+        .map(|value| format!("{value:.1} {unit}"))
+        .unwrap_or_else(|| format!("- {unit}"))
+}
+
+fn metric(value: Option<f64>, unit: &str) -> String {
+    value
+        .map(|value| format!("{value:.2} {unit}"))
+        .unwrap_or_else(|| "-".into())
 }
 
 async fn run_diagnose() -> Result<()> {

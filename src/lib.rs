@@ -19,6 +19,7 @@ pub mod location;
 pub mod logging;
 pub mod networksetup;
 pub mod notification;
+pub mod speedtest;
 pub mod terminal;
 pub mod theme;
 pub mod ui;

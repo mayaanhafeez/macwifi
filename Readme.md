@@ -15,6 +15,7 @@ Station mode only. Theming, hidden networks, QR sharing, adapter info, and a
 - **Silent reconnect**: the password you type on first connect is cached in macwifi's own login-keychain item, so reconnecting to a saved network is promptless (see [Passwords & prompts](#passwords--prompts))
 - QR-code sharing of saved networks (reads the password from the System keychain — triggers one macOS admin-auth prompt per share)
 - Adapter info popup: SSID, BSSID, RSSI, noise, channel, TX rate, MAC
+- Download, upload, and latency tests with Apple, Ookla, Netflix, or custom providers
 - **14 themes**: `default`, Catppuccin (latte/frappe/macchiato/mocha), Rose Pine (main/moon/dawn), Tokyo Night (night/storm), Gruvbox (dark/light), Nord, Dracula
 - Cycle themes live with `T` / `Shift-Tab` — choice is persisted across launches
 - TOML config at `~/.config/macwifi/config.toml`
@@ -284,7 +285,148 @@ macwifi preferred
 macwifi forget <SSID>
 macwifi themes
 macwifi diagnose
+macwifi speedtest
+macwifi speedtest --provider ookla --format json
+macwifi speedtest --provider netflix
+macwifi install-daemon
+macwifi uninstall-daemon
 ```
+
+### Speed tests and structured output
+
+`macwifi speedtest` uses macOS's built-in `networkQuality` by default, so it has
+no extra dependencies. Other providers use their official or commonly used
+CLI:
+
+| Provider | Requirement | Command |
+|---|---|---|
+| `apple` | Included with macOS | `networkQuality` |
+| `ookla` | [Official Speedtest CLI](https://www.speedtest.net/apps/cli) | `speedtest` |
+| `netflix` | [fast-cli](https://github.com/sindresorhus/fast-cli) | `fast` |
+| `custom` | Any executable that implements the JSON contract below | Configurable |
+
+Install the optional providers:
+
+```sh
+# Official Ookla CLI. Current Homebrew requires explicitly trusting its tap.
+brew tap teamookla/speedtest
+brew trust teamookla/speedtest
+brew install teamookla/speedtest/speedtest
+
+# Netflix Fast.com CLI and its Puppeteer browser dependency.
+npm install --global --allow-scripts=puppeteer fast-cli
+```
+
+The Netflix adapter uses `PUPPETEER_EXECUTABLE_PATH` when it is set. Otherwise,
+it automatically uses Google Chrome from `/Applications` when available, then
+falls back to fast-cli's Puppeteer-managed browser.
+
+#### Speed-test command list
+
+```text
+macwifi speedtest [OPTIONS]
+
+--provider <apple|ookla|netflix|custom>  Backend; default comes from config
+--format <text|json|jsonl>               Live terminal, final JSON, or event stream
+--timeout <SECONDS>                      Override the provider-aware time limit
+--server-id <ID>                         Specific Ookla server
+--custom-command <PATH>                  Custom provider executable
+--custom-arg <VALUE>                     Custom argument; repeat for multiple values
+```
+
+Examples:
+
+```sh
+macwifi speedtest --provider apple --timeout 45
+macwifi speedtest --provider ookla --server-id 12345
+macwifi speedtest --provider netflix --format json
+macwifi speedtest --provider apple --format jsonl
+macwifi speedtest --provider custom --custom-command ./my-speedtest --custom-arg value
+```
+
+Apple defaults to a 30-second measurement window, followed by up to five
+seconds for `networkQuality` to serialize its result. Ookla, Netflix, and
+custom providers default to a five-minute ceiling so browser startup and tests
+on slow connections can finish. Use `--timeout` to override the limit for one
+run.
+
+#### Process API
+
+`--format json` writes one JSON object to stdout and diagnostics to stderr. The
+normalized schema is versioned, making this the recommended interface for web,
+desktop, and mobile front ends that launch macwifi as a subprocess:
+
+```json
+{"schema_version":1,"provider":"apple","download_mbps":102.4,"upload_mbps":21.8,"ping_ms":15.2,"responsiveness_rpm":540.0,"bytes_downloaded":48123904,"bytes_uploaded":10485760,"interface":"en0","server":{"host":"example.apple.com"},"duration_ms":15342}
+```
+
+The process exits with status `0` after a valid result and non-zero on provider,
+timeout, or parsing errors. Final JSON is the only stdout line in `json` mode,
+so callers can decode it directly as `SpeedtestResult`.
+
+For live integrations, `--format jsonl` writes newline-delimited `started`,
+`progress`, `complete`, and `failed` events. Progress includes live download
+and upload throughput sampled from the active network interface every 500 ms,
+plus an updated RTT probe and elapsed time. Human-readable terminal mode shows
+the same changing values on one line. Live throughput is interface-wide and
+can include unrelated traffic; the provider's `complete` event remains the
+authoritative result.
+
+Example JSON Lines stream:
+
+```jsonl
+{"type":"started","schema_version":1,"provider":"ookla"}
+{"type":"progress","schema_version":1,"provider":"ookla","elapsed_ms":2502,"download_mbps":34.2,"upload_mbps":1.1,"ping_ms":24.8}
+{"type":"complete","schema_version":1,"result":{"schema_version":1,"provider":"ookla","download_mbps":38.9,"upload_mbps":11.6,"ping_ms":18.6,"duration_ms":28798}}
+```
+
+Consumers should switch on `type` and ignore unknown fields for forward
+compatibility. A failed stream ends with a `failed` event containing `error`
+and then exits non-zero.
+
+#### Rust API
+
+Rust clients can call the same implementation directly through the public
+`macwifi::speedtest::run(&SpeedtestOptions)` async API and receive a
+serializable `SpeedtestResult`. This avoids running an HTTP server or parsing
+terminal text while still allowing an API service to wrap the library later.
+Use `run_with_progress` to receive typed `SpeedtestEvent` callbacks while the
+test is running.
+
+```rust,no_run
+use std::time::Duration;
+use macwifi::speedtest::{run_with_progress, SpeedtestOptions, SpeedtestProvider};
+
+# async fn example() -> anyhow::Result<()> {
+let options = SpeedtestOptions {
+    provider: SpeedtestProvider::Ookla,
+    timeout: Duration::from_secs(90),
+    ..SpeedtestOptions::default()
+};
+
+let result = run_with_progress(&options, |event| {
+    // Forward this serializable event to a WebSocket, SSE stream, or UI state.
+    println!("{}", serde_json::to_string(&event).unwrap());
+}).await?;
+
+println!("final download: {:?} Mbps", result.download_mbps);
+# Ok(())
+# }
+```
+
+macwifi does not currently open an HTTP port. Front ends can use the stable
+JSON/JSONL subprocess protocol, link the Rust library directly, or expose the
+Rust events through their own HTTP, Server-Sent Events, or WebSocket service
+without changing the measurement implementation.
+
+#### Custom provider API
+
+A custom provider is invoked directly without a shell. It must print a JSON
+object containing at least one of `download_mbps`, `upload_mbps`, or `ping_ms`.
+It may also provide `loaded_latency_ms`, `jitter_ms`, `packet_loss_percent`,
+`bytes_downloaded`, `bytes_uploaded`, `interface`, `result_url`, `timestamp`,
+and `server` (`id`, `name`, `location`, `host`). macwifi adds the provider,
+schema version, and measured duration.
 
 ---
 
@@ -294,6 +436,12 @@ Optional file at `~/.config/macwifi/config.toml`:
 
 ```toml
 theme = "catppuccin-mocha"
+
+[speedtest]
+provider = "apple"
+# timeout_seconds = 600 # Optional override; defaults depend on provider
+# custom_command = "/path/to/my-speedtest"
+# custom_args = ["--some-option"]
 ```
 
 The CLI flag `--theme <name>` overrides the config file for that session.
