@@ -282,6 +282,9 @@ pub async fn cli_one_shot(
             .await
             .context("daemon reply timed out")?
             .ok_or_else(|| anyhow::anyhow!("daemon channel closed"))?;
+        if matches!(&ev, Event::Notice(message) if message.starts_with("daemon is running build ")) {
+            continue;
+        }
         let done = terminal(&ev);
         events.push(ev);
         if done {
