@@ -28,6 +28,9 @@ pub struct Hello {
 /// Default location for the daemon's accept socket. Per-user, mode 0600. The
 /// daemon ensures the parent directory exists before binding.
 pub fn socket_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("MACWIFI_SOCKET_PATH") {
+        return PathBuf::from(path);
+    }
     let base = dirs::data_dir().unwrap_or_else(std::env::temp_dir);
     base.join("macwifi").join("daemon.sock")
 }

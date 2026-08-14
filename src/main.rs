@@ -273,12 +273,9 @@ async fn run_cli(cmd: Cmd) -> Result<()> {
         Cmd::Connect { ssid, password } => {
             let req = match password {
                 Some(p) => Request::JoinWithPassword { ssid, password: p },
-                None => Request::Associate(macwifi::worker::Associate {
-                    ssid,
-                    kind: macwifi::worker::AssociateKind::Open,
-                }),
+                None => Request::JoinSaved(ssid),
             };
-            let evs = cli_one_shot(req, is_notice_or_error).await?;
+            let evs = cli_one_shot(req, is_connect_terminal).await?;
             print_terminal_event(&evs);
             Ok(())
         }
@@ -338,11 +335,18 @@ fn is_notice_or_error(ev: &Event) -> bool {
     matches!(ev, Event::Notice(_) | Event::Error(_))
 }
 
+fn is_connect_terminal(ev: &Event) -> bool {
+    is_notice_or_error(ev) || matches!(ev, Event::JoinSavedFailed { .. })
+}
+
 fn print_terminal_event(evs: &[Event]) {
     if let Some(ev) = evs.last() {
         match ev {
             Event::Notice(s) => println!("{s}"),
             Event::Error(s) => eprintln!("error: {s}"),
+            Event::JoinSavedFailed { ssid, detail, .. } => {
+                eprintln!("error: connect to {ssid} failed: {detail}")
+            }
             _ => {}
         }
     }
