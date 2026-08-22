@@ -401,12 +401,11 @@ impl App {
         match overlay {
             Overlay::Password(p) => {
                 let pw = p.input.value().to_string();
-                // Route via networksetup so Location-denied bundles still
-                // associate (CoreWLAN's associateToNetwork: is TCC-gated).
-                self.wifi.send(Request::JoinWithPassword {
-                    ssid: p.ssid,
-                    password: pw,
-                });
+                // Security can be reported as unknown for some open or
+                // captive-portal networks. A blank submission explicitly
+                // requests an open association; nonblank passwords continue
+                // through networksetup for Location-denied bundles.
+                self.wifi.send(crate::worker::join_request(p.ssid, pw));
             }
             Overlay::EnterpriseUser(p) => {
                 let username = p.input.value().to_string();
