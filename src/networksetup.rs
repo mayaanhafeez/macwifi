@@ -36,10 +36,7 @@ pub fn list_preferred(iface: &str) -> Result<Vec<String>> {
 }
 
 pub fn set_airport_network(iface: &str, ssid: &str, password: Option<&str>) -> Result<()> {
-    let mut args = vec!["-setairportnetwork", iface, ssid];
-    if let Some(p) = password {
-        args.push(p);
-    }
+    let args = airport_network_args(iface, ssid, password);
     let out = Command::new("networksetup")
         .args(&args)
         .output()
@@ -60,6 +57,14 @@ pub fn set_airport_network(iface: &str, ssid: &str, password: Option<&str>) -> R
     Ok(())
 }
 
+fn airport_network_args<'a>(iface: &'a str, ssid: &'a str, password: Option<&'a str>) -> Vec<&'a str> {
+    let mut args = vec!["-setairportnetwork", iface, ssid];
+    if let Some(password) = password.filter(|password| !password.is_empty()) {
+        args.push(password);
+    }
+    args
+}
+
 trait OrDefaultIfEmpty {
     fn or_default_if_empty(self, fallback: String) -> String;
 }
@@ -78,4 +83,25 @@ pub fn remove_preferred(iface: &str, ssid: &str) -> Result<()> {
         bail!("networksetup -removepreferredwirelessnetwork exited {status}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_password_is_omitted_from_airport_network_args() {
+        assert_eq!(
+            airport_network_args("en0", "Airport WiFi", Some("")),
+            ["-setairportnetwork", "en0", "Airport WiFi"]
+        );
+    }
+
+    #[test]
+    fn nonempty_password_is_included_in_airport_network_args() {
+        assert_eq!(
+            airport_network_args("en0", "Secure WiFi", Some("secret")),
+            ["-setairportnetwork", "en0", "Secure WiFi", "secret"]
+        );
+    }
 }

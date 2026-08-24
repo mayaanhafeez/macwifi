@@ -272,7 +272,7 @@ async fn run_cli(cmd: Cmd) -> Result<()> {
         }
         Cmd::Connect { ssid, password } => {
             let req = match password {
-                Some(p) => Request::JoinWithPassword { ssid, password: p },
+                Some(p) => macwifi::worker::join_request(ssid, p),
                 None => Request::JoinSaved(ssid),
             };
             let evs = cli_one_shot(req, is_connect_terminal).await?;

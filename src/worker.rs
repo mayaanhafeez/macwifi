@@ -55,6 +55,17 @@ pub enum AssociateKind {
     Hidden(Option<String>),
 }
 
+pub fn join_request(ssid: String, password: String) -> Request {
+    if password.is_empty() {
+        Request::Associate(Associate {
+            ssid,
+            kind: AssociateKind::Open,
+        })
+    } else {
+        Request::JoinWithPassword { ssid, password }
+    }
+}
+
 /// In-process worker handle. The daemon uses this directly; the client never
 /// constructs one. The `Local`/`Remote` enum that the TUI sees lives in
 /// `app::WifiHandle`.
@@ -455,5 +466,34 @@ fn emit_scan(iface: &WifiInterface, events: &UnboundedSender<Event>) {
         Err(e) => {
             let _ = events.send(Event::Error(format!("scan failed: {e}")));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blank_password_creates_open_association_request() {
+        let request = join_request("Airport WiFi".into(), String::new());
+
+        assert!(matches!(
+            request,
+            Request::Associate(Associate {
+                ssid,
+                kind: AssociateKind::Open,
+            }) if ssid == "Airport WiFi"
+        ));
+    }
+
+    #[test]
+    fn nonblank_password_is_preserved() {
+        let request = join_request("Secure WiFi".into(), "secret".into());
+
+        assert!(matches!(
+            request,
+            Request::JoinWithPassword { ssid, password }
+                if ssid == "Secure WiFi" && password == "secret"
+        ));
     }
 }
