@@ -50,6 +50,7 @@ fn fanout_of(event: &Event) -> Fanout {
         Event::State(_) | Event::PreferredResult(_) => Fanout::Global,
         Event::ScanStarted
         | Event::ScanResult(_)
+        | Event::ScanFailed(_)
         | Event::Notice(_)
         | Event::Error(_)
         | Event::ShareReady(_)
@@ -167,7 +168,7 @@ operation={operation_id} — starting physical scan",
             }
             Err(e) => {
                 for waiter in &completion.waiters {
-                    self.route(Self::origin(*waiter), Event::Error(e.clone()));
+                    self.route(Self::origin(*waiter), Event::ScanFailed(e.clone()));
                 }
                 crate::worker::log_scan(timings, Err(e), waiters);
             }
@@ -768,7 +769,7 @@ mod socket_tests {
         let ops = scan_operations(&h.worker);
         h.hub
             .scan_finished(ops[0], Err("scan failed: radio off".into()), timings());
-        assert!(matches!(client.next().await.event, Event::Error(_)));
+        assert!(matches!(client.next().await.event, Event::ScanFailed(_)));
 
         // In-flight state was cleared, so the next request starts a new scan
         // rather than waiting forever on the failed one.

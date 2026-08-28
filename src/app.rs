@@ -87,6 +87,21 @@ impl App {
         }
     }
 
+    /// Ask for a scan, unless one is already outstanding.
+    ///
+    /// Holding `s` down used to enqueue a request per keypress. The daemon now
+    /// coalesces those, but the TUI should not be generating them in the first
+    /// place: the spinner is already up and the extra requests answer nothing.
+    /// The flag is set here rather than waiting for `ScanStarted` so a key
+    /// repeat can't slip several requests through the round trip.
+    pub fn request_scan(&mut self) {
+        if self.scanning {
+            return;
+        }
+        self.scanning = true;
+        self.wifi.send(Request::Scan);
+    }
+
     pub fn quit(&mut self) {
         self.running = false;
     }
@@ -208,6 +223,10 @@ impl App {
         match ev {
             Event::State(s) => self.state = Some(s),
             Event::ScanStarted => self.scanning = true,
+            Event::ScanFailed(s) => {
+                self.scanning = false;
+                self.notifications.push(Notification::error(s));
+            }
             Event::ScanResult(n) => {
                 self.networks = n;
                 self.scanning = false;
@@ -455,5 +474,81 @@ impl App {
             }
             Overlay::Info | Overlay::Share(_) | Overlay::None => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::FakeWorker;
+
+    fn app() -> (App, FakeWorker) {
+        let (wifi, worker) = FakeWorker::spawn();
+        let mut app = App::new(WifiHandle::Local(wifi), None);
+        // Startup begins in the scanning state; these tests start from rest.
+        app.scanning = false;
+        (app, worker)
+    }
+
+    #[test]
+    fn repeated_scan_keypresses_do_not_enqueue_work() {
+        let (mut app, worker) = app();
+
+        app.request_scan();
+        assert_eq!(worker.commands().len(), 1);
+
+        for _ in 0..5 {
+            app.request_scan();
+        }
+        assert!(
+            worker.commands().is_empty(),
+            "a scan is already outstanding"
+        );
+    }
+
+    #[test]
+    fn scan_failure_stops_the_spinner() {
+        let (mut app, _worker) = app();
+        app.scanning = true;
+
+        app.handle_event(Event::ScanFailed("scan failed: radio off".into()));
+
+        assert!(!app.scanning);
+        assert_eq!(app.notifications.len(), 1);
+    }
+
+    #[test]
+    fn a_failed_scan_lets_the_next_one_through() {
+        let (mut app, worker) = app();
+        app.request_scan();
+        let _ = worker.commands();
+
+        app.handle_event(Event::ScanFailed("scan failed".into()));
+        app.request_scan();
+
+        assert_eq!(worker.commands().len(), 1);
+    }
+
+    #[test]
+    fn an_unrelated_error_leaves_the_spinner_alone() {
+        let (mut app, _worker) = app();
+        app.scanning = true;
+
+        // Only a scan-specific failure clears the indicator; inferring it from
+        // any error would stop the spinner on, say, a keychain complaint that
+        // arrived while the scan was still running.
+        app.handle_event(Event::Error("keychain: item not found".into()));
+
+        assert!(app.scanning);
+    }
+
+    #[test]
+    fn a_scan_result_stops_the_spinner() {
+        let (mut app, _worker) = app();
+        app.scanning = true;
+
+        app.handle_event(Event::ScanResult(Vec::new()));
+
+        assert!(!app.scanning);
     }
 }

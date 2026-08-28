@@ -645,7 +645,7 @@ fn emit_scan(iface: &WifiInterface, events: &Emitter, queue: Duration) {
         }
         Err(e) => {
             log_scan(timings, Err(&e), 1);
-            events.send(Event::Error(e));
+            events.send(Event::ScanFailed(e));
         }
     }
 }

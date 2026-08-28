@@ -28,6 +28,11 @@ pub enum Event {
     State(InterfaceState),
     ScanStarted,
     ScanResult(Vec<ScannedNetwork>),
+    /// A scan that will not produce a result. Distinct from `Error` because
+    /// only this clears the client's scanning indicator — inferring it from a
+    /// generic error means any unrelated error stops the spinner, and any
+    /// scan failure that does not look like one leaves it spinning forever.
+    ScanFailed(String),
     PreferredResult(Vec<String>),
     Notice(String),
     Error(String),

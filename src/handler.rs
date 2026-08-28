@@ -19,7 +19,7 @@ fn handle_global(app: &mut App, key: KeyEvent) {
         (KeyCode::Tab, _) => app.toggle_focus(),
         (KeyCode::Char('j'), _) | (KeyCode::Down, _) => app.move_selection(1),
         (KeyCode::Char('k'), _) | (KeyCode::Up, _) => app.move_selection(-1),
-        (KeyCode::Char('s'), _) => app.wifi.send(Request::Scan),
+        (KeyCode::Char('s'), _) => app.request_scan(),
         (KeyCode::Char('o'), _) => {
             let target = app.state.as_ref().map(|s| !s.powered).unwrap_or(true);
             app.wifi.send(Request::SetPower(target));

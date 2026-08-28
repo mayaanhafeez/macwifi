@@ -272,8 +272,14 @@ async fn run_cli(cmd: Cmd) -> Result<()> {
             Ok(())
         }
         Cmd::Scan => {
-            let evs = cli_one_shot(Request::Scan, |e| matches!(e, Event::ScanResult(_))).await?;
+            let evs = cli_one_shot(Request::Scan, |e| {
+                matches!(e, Event::ScanResult(_) | Event::ScanFailed(_))
+            })
+            .await?;
             for ev in evs {
+                if let Event::ScanFailed(message) = ev {
+                    return Err(anyhow::anyhow!(message));
+                }
                 if let Event::ScanResult(mut nets) = ev {
                     nets.sort_by_key(|n| -n.rssi);
                     println!(
