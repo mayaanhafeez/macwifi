@@ -13,15 +13,18 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
+use crate::corewlan::ScannedNetwork;
 use crate::event::Event;
 use crate::ipc::{self, ClientRequest, Hello, Reader, ServerEvent, Writer};
-use crate::worker::{LocalWifiHandle, Origin, WorkerCommand, WorkerEvent};
+use crate::scan::{self, ScanCoordinator, ScanDecision, ScanWaiter};
+use crate::worker::{LocalWifiHandle, Origin, Request, ScanTimings, WorkerCommand, WorkerEvent};
 
 /// Daemon-internal client identity, allocated once a connection has completed
 /// its handshake. Never crosses the wire — the client only ever sees the
@@ -52,6 +55,132 @@ fn fanout_of(event: &Event) -> Fanout {
         | Event::ShareReady(_)
         | Event::JoinSavedFailed { .. }
         | Event::DaemonDiagnose(_) => Fanout::Direct,
+    }
+}
+
+/// Everything a connection task needs to service a request: who is connected,
+/// what the worker is doing, and who is waiting on a scan.
+#[derive(Clone)]
+struct Hub {
+    clients: Clients,
+    coordinator: Arc<Mutex<ScanCoordinator>>,
+    wifi: LocalWifiHandle,
+}
+
+impl Hub {
+    fn route(&self, origin: Option<Origin>, event: Event) {
+        route(&self.clients, origin, event);
+    }
+
+    fn origin(waiter: ScanWaiter) -> Option<Origin> {
+        Some(Origin {
+            client_id: waiter.client_id,
+            request_id: waiter.request_id,
+        })
+    }
+
+    /// Send a scan result (plus its redaction diagnostic, if any) to one
+    /// waiter. Each client needs its own `Vec` because the reply is serialized
+    /// per connection; the `Arc` saves the copy between cache and events.
+    fn deliver_scan(
+        &self,
+        waiter: ScanWaiter,
+        networks: &Arc<Vec<ScannedNetwork>>,
+        diagnostic: Option<&str>,
+    ) {
+        let origin = Self::origin(waiter);
+        self.route(origin, Event::ScanResult(networks.as_ref().clone()));
+        if let Some(diagnostic) = diagnostic {
+            self.route(origin, Event::Error(diagnostic.to_string()));
+        }
+    }
+
+    /// Admit one `Request::Scan`, coalescing it with any scan already running
+    /// and answering it from cache when a recent result is still good.
+    fn scan_requested(&self, waiter: ScanWaiter) {
+        let received = Instant::now();
+        let origin = Self::origin(waiter);
+        let decision = self.coordinator.lock().unwrap().request(waiter, received);
+        // Every path emits `ScanStarted` first: it is what moves the TUI into
+        // its scanning state, and on a cache hit the result follows in the
+        // same breath.
+        self.route(origin, Event::ScanStarted);
+        match decision {
+            ScanDecision::Cached(networks) => {
+                let diagnostic = scan::redaction_diagnostic(&networks);
+                self.deliver_scan(waiter, &networks, diagnostic.as_deref());
+                crate::dlog!(
+                    "scan client={} request_id={} cache=hit coalesced=false total_ms={} \
+networks={} blank_ssids={} waiters=1 outcome=ok",
+                    waiter.client_id,
+                    waiter.request_id,
+                    received.elapsed().as_millis(),
+                    networks.len(),
+                    scan::blank_ssids(&networks),
+                );
+            }
+            ScanDecision::Coalesced => {
+                crate::dlog!(
+                    "scan client={} request_id={} cache=miss coalesced=true — joined running scan",
+                    waiter.client_id,
+                    waiter.request_id,
+                );
+            }
+            ScanDecision::Start { operation_id } => {
+                crate::dlog!(
+                    "scan client={} request_id={} cache=miss coalesced=false \
+operation={operation_id} — starting physical scan",
+                    waiter.client_id,
+                    waiter.request_id,
+                );
+                self.wifi.send_command(WorkerCommand::Scan { operation_id });
+            }
+        }
+    }
+
+    /// Hand a finished physical scan to everyone who waited on it.
+    fn scan_finished(
+        &self,
+        operation_id: u64,
+        result: Result<Vec<ScannedNetwork>, String>,
+        timings: ScanTimings,
+    ) {
+        let finished =
+            self.coordinator
+                .lock()
+                .unwrap()
+                .finish(operation_id, result, Instant::now());
+        let Some(completion) = finished else {
+            crate::dlog!("scan operation={operation_id} was superseded — dropping its result");
+            return;
+        };
+        let waiters = completion.waiters.len();
+        match &completion.result {
+            Ok(networks) => {
+                // Computed once so every waiter on this sweep is told the same
+                // thing.
+                let diagnostic = scan::redaction_diagnostic(networks);
+                for waiter in &completion.waiters {
+                    self.deliver_scan(*waiter, networks, diagnostic.as_deref());
+                }
+                crate::worker::log_scan(timings, Ok(networks), waiters);
+            }
+            Err(e) => {
+                for waiter in &completion.waiters {
+                    self.route(Self::origin(*waiter), Event::Error(e.clone()));
+                }
+                crate::worker::log_scan(timings, Err(e), waiters);
+            }
+        }
+        crate::dlog!(
+            "scan operation={operation_id} coordinator_ms={} waiters={waiters}",
+            completion.elapsed.as_millis(),
+        );
+    }
+
+    fn client_disconnected(&self, client_id: u64) {
+        self.clients.lock().unwrap().remove(&client_id);
+        self.coordinator.lock().unwrap().forget_client(client_id);
     }
 }
 
@@ -118,29 +247,38 @@ pub async fn run() -> Result<()> {
     let (worker_tx, mut worker_rx) = mpsc::unbounded_channel::<WorkerEvent>();
     let wifi = LocalWifiHandle::spawn(worker_tx);
 
-    let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
-    let clients_task = clients.clone();
+    let hub = Hub {
+        clients: Arc::new(Mutex::new(HashMap::new())),
+        coordinator: Arc::new(Mutex::new(ScanCoordinator::default())),
+        wifi,
+    };
+
+    let hub_task = hub.clone();
     tokio::spawn(async move {
         while let Some(ev) = worker_rx.recv().await {
             match ev {
-                WorkerEvent::Emit { origin, event } => route(&clients_task, origin, event),
+                WorkerEvent::Emit { origin, event } => hub_task.route(origin, event),
+                WorkerEvent::ScanFinished {
+                    operation_id,
+                    result,
+                    timings,
+                } => hub_task.scan_finished(operation_id, result, timings),
             }
         }
     });
 
     loop {
         let (stream, _) = listener.accept().await.context("accept unix connection")?;
-        let wifi = wifi.clone();
-        let clients = clients.clone();
+        let hub = hub.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve_one(stream, wifi, clients).await {
+            if let Err(e) = serve_one(stream, hub).await {
                 crate::dlog!("client task ended: {e:#}");
             }
         });
     }
 }
 
-async fn serve_one(stream: UnixStream, wifi: LocalWifiHandle, clients: Clients) -> Result<()> {
+async fn serve_one(stream: UnixStream, hub: Hub) -> Result<()> {
     if !peer_uid_matches(&stream)? {
         bail!("peer uid mismatch — refusing connection");
     }
@@ -170,7 +308,7 @@ async fn serve_one(stream: UnixStream, wifi: LocalWifiHandle, clients: Clients) 
 
     let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
     let (client_tx, mut client_rx) = mpsc::unbounded_channel::<ServerEvent>();
-    clients.lock().unwrap().insert(client_id, client_tx);
+    hub.clients.lock().unwrap().insert(client_id, client_tx);
     crate::dlog!("client {client_id} connected");
 
     // Writer task: drain client_rx → socket.
@@ -185,21 +323,31 @@ async fn serve_one(stream: UnixStream, wifi: LocalWifiHandle, clients: Clients) 
     });
 
     // Reader task (this task): parse requests → worker commands.
-    let result = read_requests(&mut reader, &wifi, client_id).await;
+    let result = read_requests(&mut reader, &hub, client_id).await;
 
-    clients.lock().unwrap().remove(&client_id);
+    hub.client_disconnected(client_id);
     crate::dlog!("client {client_id} disconnected");
     writer_task.abort();
     result
 }
 
-async fn read_requests(reader: &mut Reader, wifi: &LocalWifiHandle, client_id: u64) -> Result<()> {
+async fn read_requests(reader: &mut Reader, hub: &Hub, client_id: u64) -> Result<()> {
     loop {
         let req: Option<ClientRequest> = ipc::read_line(reader).await?;
         let Some(ClientRequest { id, request }) = req else {
             return Ok(());
         };
-        wifi.send_command(WorkerCommand::Request {
+        // Scans are admitted by the coordinator, which may answer from cache
+        // or fold this request into a sweep already in progress. Everything
+        // else goes straight to the CoreWLAN thread.
+        if matches!(request, Request::Scan) {
+            hub.scan_requested(ScanWaiter {
+                client_id,
+                request_id: id,
+            });
+            continue;
+        }
+        hub.wifi.send_command(WorkerCommand::Request {
             origin: Some(Origin {
                 client_id,
                 request_id: id,
@@ -340,5 +488,319 @@ mod tests {
         drop(client(&clients, 3));
         route(&clients, origin(3, 1), Event::Notice("gone".into()));
         assert!(!clients.lock().unwrap().contains_key(&3));
+    }
+}
+
+/// Socket-level tests for scan admission. They run the real `serve_one` over a
+/// real unix socket with a fake worker in place of CoreWLAN, so request
+/// correlation and coalescing are exercised end to end.
+#[cfg(test)]
+mod socket_tests {
+    use super::*;
+    use crate::corewlan::{ScannedNetwork, Security};
+    use crate::worker::{FakeWorker, ScanTimings};
+    use std::time::Duration;
+    use tokio::net::UnixStream;
+
+    struct Harness {
+        hub: Hub,
+        worker: FakeWorker,
+        path: std::path::PathBuf,
+        _dir: TempDir,
+    }
+
+    /// A unique directory removed on drop. The socket path must be short —
+    /// `sun_path` is 104 bytes on macOS — so this stays under the plain temp
+    /// dir rather than nesting.
+    struct TempDir(std::path::PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl Harness {
+        fn start() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "macwifi-t{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("d.sock");
+            let listener = UnixListener::bind(&path).unwrap();
+
+            let (wifi, worker) = FakeWorker::spawn();
+            let hub = Hub {
+                clients: Arc::new(Mutex::new(HashMap::new())),
+                coordinator: Arc::new(Mutex::new(ScanCoordinator::default())),
+                wifi,
+            };
+
+            let accept_hub = hub.clone();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let hub = accept_hub.clone();
+                    tokio::spawn(async move {
+                        let _ = serve_one(stream, hub).await;
+                    });
+                }
+            });
+
+            Self {
+                hub,
+                worker,
+                path,
+                _dir: TempDir(dir),
+            }
+        }
+
+        async fn connect(&self) -> Client {
+            let stream = UnixStream::connect(&self.path).await.unwrap();
+            let (read_half, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let hello: Hello = ipc::read_line(&mut reader).await.unwrap().unwrap();
+            assert_eq!(hello.version, ipc::PROTOCOL_VERSION);
+            ipc::write_line(
+                &mut writer,
+                &Hello {
+                    version: ipc::PROTOCOL_VERSION,
+                    build: ipc::BUILD_ID.to_string(),
+                },
+            )
+            .await
+            .unwrap();
+            Client {
+                reader,
+                writer: Some(writer),
+                next_id: 0,
+            }
+        }
+    }
+
+    struct Client {
+        reader: Reader,
+        writer: Option<Writer>,
+        next_id: u64,
+    }
+
+    impl Client {
+        async fn send(&mut self, request: Request) -> u64 {
+            self.next_id += 1;
+            ipc::write_line(
+                self.writer.as_mut().unwrap(),
+                &ClientRequest {
+                    id: self.next_id,
+                    request,
+                },
+            )
+            .await
+            .unwrap();
+            self.next_id
+        }
+
+        async fn next(&mut self) -> ServerEvent {
+            tokio::time::timeout(Duration::from_secs(5), ipc::read_line(&mut self.reader))
+                .await
+                .expect("daemon replied within 5s")
+                .unwrap()
+                .expect("connection stayed open")
+        }
+
+        fn disconnect(&mut self) {
+            self.writer.take();
+        }
+    }
+
+    fn networks(count: usize) -> Vec<ScannedNetwork> {
+        (0..count)
+            .map(|i| ScannedNetwork {
+                ssid: Some(format!("net{i}")),
+                bssid: None,
+                rssi: -50,
+                channel: None,
+                security: Security::Open,
+            })
+            .collect()
+    }
+
+    fn timings() -> ScanTimings {
+        ScanTimings {
+            queue: Duration::ZERO,
+            corewlan: Duration::from_millis(900),
+            postprocess: Duration::ZERO,
+        }
+    }
+
+    fn scan_operations(worker: &FakeWorker) -> Vec<u64> {
+        worker
+            .commands()
+            .into_iter()
+            .filter_map(|c| match c {
+                WorkerCommand::Scan { operation_id } => Some(operation_id),
+                WorkerCommand::Request { .. } => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn ten_requests_cause_one_physical_scan() {
+        let h = Harness::start();
+        let mut client = h.connect().await;
+
+        let mut ids = Vec::new();
+        for _ in 0..10 {
+            ids.push(client.send(Request::Scan).await);
+        }
+        // Each request is acknowledged with ScanStarted, so draining ten of
+        // them proves the daemon has admitted all ten.
+        for id in &ids {
+            let ev = client.next().await;
+            assert!(matches!(ev.event, Event::ScanStarted));
+            assert_eq!(ev.request_id, Some(*id));
+        }
+
+        let ops = scan_operations(&h.worker);
+        assert_eq!(ops.len(), 1, "ten requests must share one physical scan");
+
+        h.hub.scan_finished(ops[0], Ok(networks(3)), timings());
+        for id in &ids {
+            let ev = client.next().await;
+            assert_eq!(ev.request_id, Some(*id));
+            match ev.event {
+                Event::ScanResult(n) => assert_eq!(n.len(), 3),
+                other => panic!("expected a scan result, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fresh_result_is_served_without_touching_the_worker() {
+        let h = Harness::start();
+        let mut client = h.connect().await;
+
+        client.send(Request::Scan).await;
+        assert!(matches!(client.next().await.event, Event::ScanStarted));
+        let ops = scan_operations(&h.worker);
+        h.hub.scan_finished(ops[0], Ok(networks(2)), timings());
+        assert!(matches!(client.next().await.event, Event::ScanResult(_)));
+
+        let id = client.send(Request::Scan).await;
+        let started = client.next().await;
+        assert!(matches!(started.event, Event::ScanStarted));
+        assert_eq!(started.request_id, Some(id));
+        let result = client.next().await;
+        assert_eq!(result.request_id, Some(id));
+        match result.event {
+            Event::ScanResult(n) => assert_eq!(n.len(), 2),
+            other => panic!("expected the cached result, got {other:?}"),
+        }
+        assert!(
+            scan_operations(&h.worker).is_empty(),
+            "a cache hit must not reach the worker"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_clients_scanning_at_once_get_their_own_ids() {
+        let h = Harness::start();
+        let mut one = h.connect().await;
+        let mut two = h.connect().await;
+
+        // Distinct id sequences would hide a mix-up, so make them collide:
+        // both clients use request id 1.
+        let id_one = one.send(Request::Scan).await;
+        assert!(matches!(one.next().await.event, Event::ScanStarted));
+        let id_two = two.send(Request::Scan).await;
+        assert!(matches!(two.next().await.event, Event::ScanStarted));
+        assert_eq!(id_one, id_two, "both clients used request id 1");
+
+        let ops = scan_operations(&h.worker);
+        assert_eq!(ops.len(), 1);
+        h.hub.scan_finished(ops[0], Ok(networks(1)), timings());
+
+        for client in [&mut one, &mut two] {
+            let ev = client.next().await;
+            assert_eq!(ev.request_id, Some(1));
+            assert!(matches!(ev.event, Event::ScanResult(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_leaving_mid_scan_does_not_affect_the_others() {
+        let h = Harness::start();
+        let mut staying = h.connect().await;
+        let mut leaving = h.connect().await;
+
+        staying.send(Request::Scan).await;
+        assert!(matches!(staying.next().await.event, Event::ScanStarted));
+        leaving.send(Request::Scan).await;
+        assert!(matches!(leaving.next().await.event, Event::ScanStarted));
+
+        leaving.disconnect();
+        drop(leaving);
+        // Wait for the daemon's reader task to observe the EOF.
+        for _ in 0..100 {
+            if h.hub.clients.lock().unwrap().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(h.hub.clients.lock().unwrap().len(), 1);
+
+        let ops = scan_operations(&h.worker);
+        h.hub.scan_finished(ops[0], Ok(networks(4)), timings());
+        match staying.next().await.event {
+            Event::ScanResult(n) => assert_eq!(n.len(), 4),
+            other => panic!("expected a scan result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_scan_releases_every_waiter() {
+        let h = Harness::start();
+        let mut client = h.connect().await;
+
+        client.send(Request::Scan).await;
+        assert!(matches!(client.next().await.event, Event::ScanStarted));
+        let ops = scan_operations(&h.worker);
+        h.hub
+            .scan_finished(ops[0], Err("scan failed: radio off".into()), timings());
+        assert!(matches!(client.next().await.event, Event::Error(_)));
+
+        // In-flight state was cleared, so the next request starts a new scan
+        // rather than waiting forever on the failed one.
+        client.send(Request::Scan).await;
+        assert!(matches!(client.next().await.event, Event::ScanStarted));
+        assert_eq!(scan_operations(&h.worker).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_stale_protocol_version_is_rejected_readably() {
+        let h = Harness::start();
+        let stream = UnixStream::connect(&h.path).await.unwrap();
+        let (read_half, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+        let _: Hello = ipc::read_line(&mut reader).await.unwrap().unwrap();
+        ipc::write_line(
+            &mut writer,
+            &Hello {
+                version: ipc::PROTOCOL_VERSION - 1,
+                build: "old".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // The daemon drops the connection; the client sees EOF rather than
+        // hanging, and its own handshake check produces the actionable message.
+        let next: Option<ServerEvent> =
+            tokio::time::timeout(Duration::from_secs(5), ipc::read_line(&mut reader))
+                .await
+                .expect("daemon closed the connection promptly")
+                .unwrap();
+        assert!(next.is_none());
     }
 }

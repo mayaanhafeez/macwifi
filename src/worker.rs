@@ -14,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::corewlan::{Security, WifiClient, WifiInterface};
+use crate::corewlan::{ScannedNetwork, Security, WifiClient, WifiInterface};
 use crate::event::{Event, JoinFailReason, SharePayload};
 use crate::{dlog, keychain, networksetup};
 
@@ -93,6 +93,10 @@ pub enum WorkerCommand {
         origin: Option<Origin>,
         request: Request,
     },
+    /// A physical scan the daemon's coordinator started. It carries an
+    /// operation id rather than an origin because one sweep may be answering
+    /// any number of clients — the coordinator, not the worker, knows who.
+    Scan { operation_id: u64 },
 }
 
 /// What the CoreWLAN thread reports back.
@@ -102,6 +106,30 @@ pub enum WorkerEvent {
         origin: Option<Origin>,
         event: Event,
     },
+    ScanFinished {
+        operation_id: u64,
+        result: Result<Vec<ScannedNetwork>, String>,
+        timings: ScanTimings,
+    },
+}
+
+/// Where one scan's time went, split at the boundaries we can actually act on.
+///
+/// `queue` is time the command spent behind other worker operations — ours to
+/// fix. `corewlan` is the synchronous channel sweep — not ours to fix, only to
+/// stop asking for redundantly.
+#[derive(Debug, Clone, Copy)]
+pub struct ScanTimings {
+    pub queue: Duration,
+    pub corewlan: Duration,
+    pub postprocess: Duration,
+}
+
+impl ScanTimings {
+    /// Everything the worker thread was responsible for.
+    pub fn worker_total(&self) -> Duration {
+        self.queue + self.corewlan + self.postprocess
+    }
 }
 
 /// In-process worker handle. The daemon uses this directly; the client never
@@ -158,6 +186,30 @@ impl LocalWifiHandle {
             origin: None,
             request: req,
         });
+    }
+}
+
+/// A worker handle that records commands instead of driving CoreWLAN, so the
+/// daemon's scan admission can be tested without a radio.
+#[cfg(test)]
+pub(crate) struct FakeWorker {
+    rx: std_mpsc::Receiver<Queued>,
+}
+
+#[cfg(test)]
+impl FakeWorker {
+    pub(crate) fn spawn() -> (LocalWifiHandle, Self) {
+        let (tx, rx) = std_mpsc::channel::<Queued>();
+        (LocalWifiHandle { tx }, Self { rx })
+    }
+
+    /// The next command the daemon sent, if any.
+    pub(crate) fn try_next(&self) -> Option<WorkerCommand> {
+        self.rx.try_recv().ok().map(|q| q.command)
+    }
+
+    pub(crate) fn commands(&self) -> Vec<WorkerCommand> {
+        std::iter::from_fn(|| self.try_next()).collect()
     }
 }
 
@@ -222,6 +274,14 @@ fn worker_loop(rx: std_mpsc::Receiver<Queued>, events: UnboundedSender<WorkerEve
                     origin,
                 };
                 dispatch(&iface, &emitter, request, queue);
+            }
+            WorkerCommand::Scan { operation_id } => {
+                let (result, timings) = run_scan(&iface, queue);
+                let _ = events.send(WorkerEvent::ScanFinished {
+                    operation_id,
+                    result,
+                    timings,
+                });
             }
         }
     }
@@ -541,73 +601,69 @@ fn share_uri(ssid: &str, security: ShareSecurity, password: Option<&str>) -> (St
     )
 }
 
-fn emit_scan(iface: &WifiInterface, events: &Emitter, queue: Duration) {
-    events.send(Event::ScanStarted);
+/// Run one physical scan, sorted strongest-signal-first, and report where the
+/// time went. Post-processing is measured separately so a slow sample can be
+/// blamed on the right layer.
+fn run_scan(
+    iface: &WifiInterface,
+    queue: Duration,
+) -> (Result<Vec<ScannedNetwork>, String>, ScanTimings) {
     let scan_start = Instant::now();
     let result = iface.scan();
     let corewlan = scan_start.elapsed();
     let post_start = Instant::now();
-    match result {
+    let result = match result {
         Ok(mut n) => {
             n.sort_by_key(|x| -x.rssi);
-            let blank = n
-                .iter()
-                .filter(|x| x.ssid.as_deref().is_none_or(str::is_empty))
-                .count();
-            let all_blank = !n.is_empty() && blank == n.len();
-            let postprocess = post_start.elapsed();
-            log_scan(
-                queue,
-                corewlan,
-                postprocess,
-                ScanLogOutcome::Ok {
-                    networks: n.len(),
-                    blank,
-                },
-            );
-            events.send(Event::ScanResult(n));
-            if all_blank {
-                if let Some(hint) = crate::location::redaction_hint() {
-                    events.send(Event::Error(hint.to_string()));
-                } else {
-                    // Location says we're authorized but SSIDs are still
-                    // redacted — almost always means the running executable
-                    // isn't the bundled one TCC granted.
-                    events.send(Event::Error(
-                        "SSIDs redacted despite Location auth — run via bundled .app (scripts/bundle.sh) so TCC matches this binary".into(),
-                    ));
-                }
+            Ok(n)
+        }
+        Err(e) => Err(format!("scan failed: {e}")),
+    };
+    let timings = ScanTimings {
+        queue,
+        corewlan,
+        postprocess: post_start.elapsed(),
+    };
+    (result, timings)
+}
+
+/// The direct `Request::Scan` path, used by an in-process `WifiHandle::Local`.
+/// The daemon does not come through here — its scans are admitted by
+/// `scan::ScanCoordinator` so they can be coalesced and cached — but both paths
+/// share `run_scan` and the redaction diagnostic so the two cannot drift.
+fn emit_scan(iface: &WifiInterface, events: &Emitter, queue: Duration) {
+    events.send(Event::ScanStarted);
+    let (result, timings) = run_scan(iface, queue);
+    match result {
+        Ok(networks) => {
+            let diagnostic = crate::scan::redaction_diagnostic(&networks);
+            log_scan(timings, Ok(&networks), 1);
+            events.send(Event::ScanResult(networks));
+            if let Some(diagnostic) = diagnostic {
+                events.send(Event::Error(diagnostic));
             }
         }
         Err(e) => {
-            log_scan(queue, corewlan, post_start.elapsed(), ScanLogOutcome::Error);
-            events.send(Event::Error(format!("scan failed: {e}")));
+            log_scan(timings, Err(&e), 1);
+            events.send(Event::Error(e));
         }
     }
 }
 
-enum ScanLogOutcome {
-    Ok { networks: usize, blank: usize },
-    Error,
-}
-
 /// One machine-readable line per scan so a slow sample can be attributed to
-/// worker queueing, CoreWLAN itself, or our own post-processing. `queue_ms` is
-/// time the request spent behind other worker operations; `corewlan_ms` is the
-/// synchronous `scanForNetworksWithName:` call we cannot cancel or speed up.
-fn log_scan(queue: Duration, corewlan: Duration, postprocess: Duration, outcome: ScanLogOutcome) {
-    let total = queue + corewlan + postprocess;
-    let (networks, blank, outcome) = match outcome {
-        ScanLogOutcome::Ok { networks, blank } => (networks, blank, "ok"),
-        ScanLogOutcome::Error => (0, 0, "error"),
+/// worker queueing, CoreWLAN itself, or our own post-processing.
+pub fn log_scan(timings: ScanTimings, result: Result<&[ScannedNetwork], &str>, waiters: usize) {
+    let (networks, blank, outcome) = match result {
+        Ok(n) => (n.len(), crate::scan::blank_ssids(n), "ok"),
+        Err(_) => (0, 0, "error"),
     };
     dlog!(
-        "scan queue_ms={} corewlan_ms={} postprocess_ms={} total_ms={} \
-networks={networks} blank_ssids={blank} outcome={outcome}",
-        queue.as_millis(),
-        corewlan.as_millis(),
-        postprocess.as_millis(),
-        total.as_millis(),
+        "scan queue_ms={} corewlan_ms={} postprocess_ms={} worker_total_ms={} \
+networks={networks} blank_ssids={blank} waiters={waiters} outcome={outcome}",
+        timings.queue.as_millis(),
+        timings.corewlan.as_millis(),
+        timings.postprocess.as_millis(),
+        timings.worker_total().as_millis(),
     );
 }
 
