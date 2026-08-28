@@ -1,8 +1,12 @@
 //! Dedicated worker thread that owns the CoreWLAN handles.
 //!
 //! `Retained<CWInterface>` is not `Send`, so we pin it to one OS thread and
-//! drive it via a `std::sync::mpsc` request channel. Responses flow back as
-//! `Event` values on the shared tokio channel the UI reads from.
+//! drive it via a `std::sync::mpsc` command channel. Responses flow back as
+//! `WorkerEvent` values on a tokio channel the daemon reads from.
+//!
+//! Worker *commands* are deliberately a different type from socket `Request`s:
+//! commands carry the requesting client's `Origin` and other daemon-internal
+//! bookkeeping that must never reach the wire.
 
 use serde::{Deserialize, Serialize};
 use std::sync::mpsc::{self as std_mpsc, Sender};
@@ -73,6 +77,33 @@ pub fn join_request(ssid: String, password: String) -> Request {
     }
 }
 
+/// Identifies the client request an emitted event answers, so the daemon can
+/// address the reply instead of broadcasting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Origin {
+    pub client_id: u64,
+    pub request_id: u64,
+}
+
+/// What the daemon asks the CoreWLAN thread to do. Not serializable: unlike
+/// `Request` this never crosses the socket.
+#[derive(Debug, Clone)]
+pub enum WorkerCommand {
+    Request {
+        origin: Option<Origin>,
+        request: Request,
+    },
+}
+
+/// What the CoreWLAN thread reports back.
+#[derive(Debug, Clone)]
+pub enum WorkerEvent {
+    Emit {
+        origin: Option<Origin>,
+        event: Event,
+    },
+}
+
 /// In-process worker handle. The daemon uses this directly; the client never
 /// constructs one. The `Local`/`Remote` enum that the TUI sees lives in
 /// `app::WifiHandle`.
@@ -81,17 +112,32 @@ pub struct LocalWifiHandle {
     tx: Sender<Queued>,
 }
 
-/// A request plus the instant it entered the worker queue. The worker is a
+/// A command plus the instant it entered the worker queue. The worker is a
 /// strict FIFO over one CoreWLAN thread, so the gap between these two points is
-/// exactly the latency an unrelated slow operation imposed on this request —
-/// the number Phase 1 of the scan performance work exists to expose.
+/// exactly the latency an unrelated slow operation imposed on this command.
 struct Queued {
-    req: Request,
+    command: WorkerCommand,
     enqueued: Instant,
 }
 
+/// Event sink bound to one command's origin, so `dispatch` doesn't have to
+/// thread the origin through every emit site.
+struct Emitter {
+    tx: UnboundedSender<WorkerEvent>,
+    origin: Option<Origin>,
+}
+
+impl Emitter {
+    fn send(&self, event: Event) {
+        let _ = self.tx.send(WorkerEvent::Emit {
+            origin: self.origin,
+            event,
+        });
+    }
+}
+
 impl LocalWifiHandle {
-    pub fn spawn(events: UnboundedSender<Event>) -> Self {
+    pub fn spawn(events: UnboundedSender<WorkerEvent>) -> Self {
         let (tx, rx) = std_mpsc::channel::<Queued>();
         thread::Builder::new()
             .name("wifi-worker".into())
@@ -100,10 +146,17 @@ impl LocalWifiHandle {
         Self { tx }
     }
 
-    pub fn send(&self, req: Request) {
+    pub fn send_command(&self, command: WorkerCommand) {
         let _ = self.tx.send(Queued {
-            req,
+            command,
             enqueued: Instant::now(),
+        });
+    }
+
+    pub fn send(&self, req: Request) {
+        self.send_command(WorkerCommand::Request {
+            origin: None,
+            request: req,
         });
     }
 }
@@ -135,34 +188,47 @@ impl WifiHandle {
 /// physical scan. Initial scan demand belongs to whoever actually connects.
 const STARTUP_REQUESTS: &[Request] = &[Request::RefreshState, Request::RefreshPreferred];
 
-fn worker_loop(rx: std_mpsc::Receiver<Queued>, events: UnboundedSender<Event>) {
+fn worker_loop(rx: std_mpsc::Receiver<Queued>, events: UnboundedSender<WorkerEvent>) {
+    // Startup failures are nobody's request, so they broadcast.
+    let startup = Emitter {
+        tx: events.clone(),
+        origin: None,
+    };
     let client = match WifiClient::shared() {
         Ok(c) => c,
         Err(e) => {
-            let _ = events.send(Event::Error(format!("CoreWLAN init failed: {e}")));
+            startup.send(Event::Error(format!("CoreWLAN init failed: {e}")));
             return;
         }
     };
     let iface = match client.default_interface() {
         Ok(i) => i,
         Err(e) => {
-            let _ = events.send(Event::Error(format!("no Wi-Fi interface: {e}")));
+            startup.send(Event::Error(format!("no Wi-Fi interface: {e}")));
             return;
         }
     };
 
     for req in STARTUP_REQUESTS {
-        dispatch(&iface, &events, req.clone(), Duration::ZERO);
+        dispatch(&iface, &startup, req.clone(), Duration::ZERO);
     }
 
-    while let Ok(Queued { req, enqueued }) = rx.recv() {
+    while let Ok(Queued { command, enqueued }) = rx.recv() {
         let queue = enqueued.elapsed();
-        dispatch(&iface, &events, req, queue);
+        match command {
+            WorkerCommand::Request { origin, request } => {
+                let emitter = Emitter {
+                    tx: events.clone(),
+                    origin,
+                };
+                dispatch(&iface, &emitter, request, queue);
+            }
+        }
     }
 }
 
 /// Handle one worker request on the CoreWLAN thread.
-fn dispatch(iface: &WifiInterface, events: &UnboundedSender<Event>, req: Request, queue: Duration) {
+fn dispatch(iface: &WifiInterface, events: &Emitter, req: Request, queue: Duration) {
     match req {
         Request::RefreshState => emit_state(iface, events),
         Request::RefreshPreferred => emit_preferred(iface, events),
@@ -171,17 +237,17 @@ fn dispatch(iface: &WifiInterface, events: &UnboundedSender<Event>, req: Request
             if let Err(e) = iface.set_power(on) {
                 let name = iface.name();
                 if let Err(e2) = networksetup::set_power(&name, on) {
-                    let _ = events.send(Event::Error(format!(
+                    events.send(Event::Error(format!(
                         "power toggle failed: CoreWLAN={e}; networksetup={e2}"
                     )));
                 } else {
-                    let _ = events.send(Event::Notice(format!(
+                    events.send(Event::Notice(format!(
                         "Wi-Fi {}",
                         if on { "on" } else { "off" }
                     )));
                 }
             } else {
-                let _ = events.send(Event::Notice(format!(
+                events.send(Event::Notice(format!(
                     "Wi-Fi {}",
                     if on { "on" } else { "off" }
                 )));
@@ -206,10 +272,10 @@ fn dispatch(iface: &WifiInterface, events: &UnboundedSender<Event>, req: Request
             };
             match result {
                 Ok(()) => {
-                    let _ = events.send(Event::Notice(format!("connected to {ssid}")));
+                    events.send(Event::Notice(format!("connected to {ssid}")));
                 }
                 Err(e) => {
-                    let _ = events.send(Event::Error(format!("connect failed: {e}")));
+                    events.send(Event::Error(format!("connect failed: {e}")));
                 }
             }
             emit_state(iface, events);
@@ -232,17 +298,17 @@ fn dispatch(iface: &WifiInterface, events: &UnboundedSender<Event>, req: Request
                         dlog!("cached password for {ssid}");
                     }
                     if verify_join(iface, &ssid) {
-                        let _ = events.send(Event::Notice(format!("connected to {ssid}")));
+                        events.send(Event::Notice(format!("connected to {ssid}")));
                     } else {
                         dlog!("join to {ssid}: networksetup ok but association unconfirmed");
-                        let _ = events.send(Event::Notice(format!(
+                        events.send(Event::Notice(format!(
                             "join to {ssid} sent — association not yet confirmed, it may still complete"
                         )));
                     }
                 }
                 Err(e) => {
                     dlog!("join to {ssid} failed: {e:#}");
-                    let _ = events.send(Event::Error(format!("join failed: {e}")));
+                    events.send(Event::Error(format!("join failed: {e}")));
                 }
             }
             emit_state(iface, events);
@@ -260,11 +326,11 @@ fn dispatch(iface: &WifiInterface, events: &UnboundedSender<Event>, req: Request
             match outcome {
                 Ok(()) => {
                     dlog!("reconnected to {ssid}");
-                    let _ = events.send(Event::Notice(format!("connected to {ssid}")));
+                    events.send(Event::Notice(format!("connected to {ssid}")));
                 }
                 Err((reason, detail)) => {
                     dlog!("JoinSaved({ssid}) failed: {reason:?} — {detail}");
-                    let _ = events.send(Event::JoinSavedFailed {
+                    events.send(Event::JoinSavedFailed {
                         ssid,
                         reason,
                         detail,
@@ -275,7 +341,7 @@ fn dispatch(iface: &WifiInterface, events: &UnboundedSender<Event>, req: Request
         }
         Request::Disconnect => {
             iface.disassociate();
-            let _ = events.send(Event::Notice("disconnected".into()));
+            events.send(Event::Notice("disconnected".into()));
             emit_state(iface, events);
         }
         Request::Share { ssid, security } => {
@@ -284,14 +350,13 @@ fn dispatch(iface: &WifiInterface, events: &UnboundedSender<Event>, req: Request
                 ShareSecurity::Wpa | ShareSecurity::Wep => match keychain::share_password(&ssid) {
                     Ok(password) => Some(password),
                     Err(e) => {
-                        let _ =
-                            events.send(Event::Error(format!("keychain: {e} — sharing SSID only")));
+                        events.send(Event::Error(format!("keychain: {e} — sharing SSID only")));
                         None
                     }
                 },
             };
             let (uri, has_pw) = share_uri(&ssid, security, password.as_deref());
-            let _ = events.send(Event::ShareReady(SharePayload {
+            events.send(Event::ShareReady(SharePayload {
                 schema_version: 1,
                 ssid,
                 uri,
@@ -305,10 +370,10 @@ fn dispatch(iface: &WifiInterface, events: &UnboundedSender<Event>, req: Request
             let _ = keychain::forget_cached(&ssid);
             match networksetup::remove_preferred(&name, &ssid) {
                 Ok(()) => {
-                    let _ = events.send(Event::Notice(format!("forgot {ssid}")));
+                    events.send(Event::Notice(format!("forgot {ssid}")));
                 }
                 Err(e) => {
-                    let _ = events.send(Event::Error(format!("forget failed: {e}")));
+                    events.send(Event::Error(format!("forget failed: {e}")));
                 }
             }
             emit_preferred(iface, events);
@@ -319,7 +384,7 @@ fn dispatch(iface: &WifiInterface, events: &UnboundedSender<Event>, req: Request
     }
 }
 
-fn emit_diagnose(iface: &WifiInterface, events: &UnboundedSender<Event>) {
+fn emit_diagnose(iface: &WifiInterface, events: &Emitter) {
     use crate::event::DaemonDiagnose;
     let state = iface.state();
     let scan = iface.scan().unwrap_or_default();
@@ -337,7 +402,7 @@ fn emit_diagnose(iface: &WifiInterface, events: &UnboundedSender<Event>) {
         Ok(s) => (s.name.clone(), s.ssid.clone()),
         Err(_) => (iface.name(), None),
     };
-    let _ = events.send(Event::DaemonDiagnose(DaemonDiagnose {
+    events.send(Event::DaemonDiagnose(DaemonDiagnose {
         pid,
         parent_pid,
         location_auth_raw,
@@ -348,13 +413,13 @@ fn emit_diagnose(iface: &WifiInterface, events: &UnboundedSender<Event>) {
     }));
 }
 
-fn emit_state(iface: &WifiInterface, events: &UnboundedSender<Event>) {
+fn emit_state(iface: &WifiInterface, events: &Emitter) {
     match iface.state() {
         Ok(s) => {
-            let _ = events.send(Event::State(s));
+            events.send(Event::State(s));
         }
         Err(e) => {
-            let _ = events.send(Event::Error(format!("state refresh failed: {e}")));
+            events.send(Event::Error(format!("state refresh failed: {e}")));
         }
     }
 }
@@ -434,14 +499,14 @@ fn verify_join(iface: &WifiInterface, ssid: &str) -> bool {
     false
 }
 
-fn emit_preferred(iface: &WifiInterface, events: &UnboundedSender<Event>) {
+fn emit_preferred(iface: &WifiInterface, events: &Emitter) {
     let name = iface.name();
     match networksetup::list_preferred(&name) {
         Ok(v) => {
-            let _ = events.send(Event::PreferredResult(v));
+            events.send(Event::PreferredResult(v));
         }
         Err(e) => {
-            let _ = events.send(Event::Error(format!("preferred list failed: {e}")));
+            events.send(Event::Error(format!("preferred list failed: {e}")));
         }
     }
 }
@@ -476,8 +541,8 @@ fn share_uri(ssid: &str, security: ShareSecurity, password: Option<&str>) -> (St
     )
 }
 
-fn emit_scan(iface: &WifiInterface, events: &UnboundedSender<Event>, queue: Duration) {
-    let _ = events.send(Event::ScanStarted);
+fn emit_scan(iface: &WifiInterface, events: &Emitter, queue: Duration) {
+    events.send(Event::ScanStarted);
     let scan_start = Instant::now();
     let result = iface.scan();
     let corewlan = scan_start.elapsed();
@@ -500,15 +565,15 @@ fn emit_scan(iface: &WifiInterface, events: &UnboundedSender<Event>, queue: Dura
                     blank,
                 },
             );
-            let _ = events.send(Event::ScanResult(n));
+            events.send(Event::ScanResult(n));
             if all_blank {
                 if let Some(hint) = crate::location::redaction_hint() {
-                    let _ = events.send(Event::Error(hint.to_string()));
+                    events.send(Event::Error(hint.to_string()));
                 } else {
                     // Location says we're authorized but SSIDs are still
                     // redacted — almost always means the running executable
                     // isn't the bundled one TCC granted.
-                    let _ = events.send(Event::Error(
+                    events.send(Event::Error(
                         "SSIDs redacted despite Location auth — run via bundled .app (scripts/bundle.sh) so TCC matches this binary".into(),
                     ));
                 }
@@ -516,7 +581,7 @@ fn emit_scan(iface: &WifiInterface, events: &UnboundedSender<Event>, queue: Dura
         }
         Err(e) => {
             log_scan(queue, corewlan, post_start.elapsed(), ScanLogOutcome::Error);
-            let _ = events.send(Event::Error(format!("scan failed: {e}")));
+            events.send(Event::Error(format!("scan failed: {e}")));
         }
     }
 }

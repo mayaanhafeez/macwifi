@@ -178,7 +178,8 @@ async fn run_tui(theme_name: Option<String>) -> Result<()> {
 
 async fn drive(tui: &mut Tui, theme_name: Option<&str>) -> Result<()> {
     let mut ui_events = UiEventHandler::new(250);
-    let (wire_tx, mut wire_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let (wire_tx, mut wire_rx) =
+        tokio::sync::mpsc::unbounded_channel::<macwifi::ipc::ServerEvent>();
     // The remote handle requests an initial snapshot on every (re)connect, so
     // the TUI doesn't need to prime it here.
     let remote = RemoteWifiHandle::connect(wire_tx.clone()).await?;
@@ -194,7 +195,11 @@ async fn drive(tui: &mut Tui, theme_name: Option<&str>) -> Result<()> {
                 UiEvent::Resize(_, _) => {}
             },
             Some(wire_ev) = wire_rx.recv() => {
-                app.handle_event(wire_ev);
+                // The TUI reacts to whatever the daemon reports, so it drops
+                // the correlation id: an unsolicited state change from another
+                // client is exactly as interesting as a reply to its own key
+                // press.
+                app.handle_event(wire_ev.event);
             }
         }
     }
