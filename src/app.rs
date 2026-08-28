@@ -127,7 +127,7 @@ impl App {
         let len = self.visible_preferred().len();
         if len == 0 {
             self.preferred_state.select(None);
-        } else if self.preferred_state.selected().map_or(true, |i| i >= len) {
+        } else if self.preferred_state.selected().is_none_or(|i| i >= len) {
             self.preferred_state.select(Some(0));
         }
     }
@@ -180,7 +180,8 @@ impl App {
     }
 
     pub fn visible_networks(&self) -> Vec<&ScannedNetwork> {
-        let mut out = self.networks
+        let mut out = self
+            .networks
             .iter()
             .filter(|n| {
                 // impala parity: a scanned network we already have a saved
@@ -189,18 +190,17 @@ impl App {
                 let known = n
                     .ssid
                     .as_deref()
-                    .map_or(false, |s| self.preferred.iter().any(|p| p == s));
+                    .is_some_and(|s| self.preferred.iter().any(|p| p == s));
                 if known {
                     return false;
                 }
                 // `show_all` additionally reveals weak-signal and
                 // hidden/redacted networks that are otherwise filtered out.
-                self.show_all
-                    || (n.ssid.as_deref().map_or(false, |s| !s.is_empty()) && n.rssi > -85)
+                self.show_all || (n.ssid.as_deref().is_some_and(|s| !s.is_empty()) && n.rssi > -85)
             })
             .collect::<Vec<_>>();
         // Sort strongest signal first (RSSI is negative; higher = stronger).
-        out.sort_by(|a, b| b.rssi.cmp(&a.rssi));
+        out.sort_by_key(|n| -n.rssi);
         out
     }
 
@@ -215,7 +215,7 @@ impl App {
                 let len = self.visible_networks().len();
                 if len == 0 {
                     self.available_state.select(None);
-                } else if self.available_state.selected().map_or(true, |i| i >= len) {
+                } else if self.available_state.selected().is_none_or(|i| i >= len) {
                     self.available_state.select(Some(0));
                 }
                 // The Known Networks list is filtered by what's in range, so it
@@ -223,7 +223,7 @@ impl App {
                 let plen = self.visible_preferred().len();
                 if plen == 0 {
                     self.preferred_state.select(None);
-                } else if self.preferred_state.selected().map_or(true, |i| i >= plen) {
+                } else if self.preferred_state.selected().is_none_or(|i| i >= plen) {
                     self.preferred_state.select(Some(0));
                 }
             }
@@ -233,14 +233,18 @@ impl App {
                 let len = self.visible_preferred().len();
                 if len == 0 {
                     self.preferred_state.select(None);
-                } else if self.preferred_state.selected().map_or(true, |i| i >= len) {
+                } else if self.preferred_state.selected().is_none_or(|i| i >= len) {
                     self.preferred_state.select(Some(0));
                 }
             }
             Event::Notice(s) => self.notifications.push(Notification::info(s)),
             Event::Error(s) => self.notifications.push(Notification::error(s)),
             Event::ShareReady(p) => self.overlay = Overlay::Share(p),
-            Event::JoinSavedFailed { ssid, reason, detail } => {
+            Event::JoinSavedFailed {
+                ssid,
+                reason,
+                detail,
+            } => {
                 match reason {
                     // Out of range isn't a credential problem — a password
                     // prompt would be misleading. Just say so.
@@ -389,9 +393,9 @@ impl App {
         {
             Some(Security::Open) => Some(ShareSecurity::Nopass),
             Some(Security::Wep) => Some(ShareSecurity::Wep),
-            Some(
-                Security::WpaEnterprise | Security::Wpa2Enterprise | Security::Wpa3Enterprise,
-            ) => None,
+            Some(Security::WpaEnterprise | Security::Wpa2Enterprise | Security::Wpa3Enterprise) => {
+                None
+            }
             _ => Some(ShareSecurity::Wpa),
         }
     }

@@ -208,8 +208,7 @@ async fn establish(path: &Path, events: &UnboundedSender<Event>) -> Result<Conn>
 
     // Handshake: server speaks first.
     let server_hello: Option<Hello> = ipc::read_line(&mut reader).await?;
-    let server_hello =
-        server_hello.ok_or_else(|| anyhow::anyhow!("daemon closed before hello"))?;
+    let server_hello = server_hello.ok_or_else(|| anyhow::anyhow!("daemon closed before hello"))?;
     if server_hello.version != ipc::PROTOCOL_VERSION {
         bail!(
             "protocol version mismatch (server {}, client {}) — the daemon is a \
@@ -264,10 +263,7 @@ async fn connect_with_retry(path: &Path, events: &UnboundedSender<Event>) -> Res
 /// Open a one-shot connection, send one request, drain events until
 /// `terminal` matches one, then disconnect. Used by every CLI subcommand
 /// that operates through the daemon.
-pub async fn cli_one_shot(
-    req: Request,
-    terminal: impl Fn(&Event) -> bool,
-) -> Result<Vec<Event>> {
+pub async fn cli_one_shot(req: Request, terminal: impl Fn(&Event) -> bool) -> Result<Vec<Event>> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
     let handle = RemoteWifiHandle::connect_oneshot(tx)
         .await
@@ -282,7 +278,8 @@ pub async fn cli_one_shot(
             .await
             .context("daemon reply timed out")?
             .ok_or_else(|| anyhow::anyhow!("daemon channel closed"))?;
-        if matches!(&ev, Event::Notice(message) if message.starts_with("daemon is running build ")) {
+        if matches!(&ev, Event::Notice(message) if message.starts_with("daemon is running build "))
+        {
             continue;
         }
         let done = terminal(&ev);

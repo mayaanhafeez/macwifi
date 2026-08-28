@@ -26,10 +26,10 @@ fn handle_global(app: &mut App, key: KeyEvent) {
         }
         (KeyCode::Char('x'), _) => app.wifi.send(Request::Disconnect),
         (KeyCode::Char('d'), _) => {
-            if app.focus == Focus::Preferred {
-                if let Some(ssid) = app.selected_preferred() {
-                    app.wifi.send(Request::Forget(ssid));
-                }
+            if app.focus == Focus::Preferred
+                && let Some(ssid) = app.selected_preferred()
+            {
+                app.wifi.send(Request::Forget(ssid));
             }
         }
         (KeyCode::Char('p'), _) => app.share_selected_preferred(),

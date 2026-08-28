@@ -272,8 +272,8 @@ async fn run_cli(cmd: Cmd) -> Result<()> {
                 if let Event::ScanResult(mut nets) = ev {
                     nets.sort_by_key(|n| -n.rssi);
                     println!(
-                        "{:<32}  {:>5}  {:>4}  {:<10}  {}",
-                        "SSID", "RSSI", "CH", "SEC", "BSSID"
+                        "{:<32}  {:>5}  {:>4}  {:<10}  BSSID",
+                        "SSID", "RSSI", "CH", "SEC"
                     );
                     for n in &nets {
                         println!(

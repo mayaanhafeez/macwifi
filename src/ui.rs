@@ -37,19 +37,39 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let theme = app.theme;
     match &app.overlay {
         Overlay::None => {}
-        Overlay::Password(p) => draw_input(f, area, theme, "Password", &p.ssid, p.input.value(), true),
-        Overlay::EnterpriseUser(p) => {
-            draw_input(f, area, theme, "Username (PEAP)", &p.ssid, p.input.value(), false)
+        Overlay::Password(p) => {
+            draw_input(f, area, theme, "Password", &p.ssid, p.input.value(), true)
         }
-        Overlay::EnterprisePass(p) => {
-            draw_input(f, area, theme, "Password (PEAP)", &p.ssid, p.input.value(), true)
-        }
+        Overlay::EnterpriseUser(p) => draw_input(
+            f,
+            area,
+            theme,
+            "Username (PEAP)",
+            &p.ssid,
+            p.input.value(),
+            false,
+        ),
+        Overlay::EnterprisePass(p) => draw_input(
+            f,
+            area,
+            theme,
+            "Password (PEAP)",
+            &p.ssid,
+            p.input.value(),
+            true,
+        ),
         Overlay::HiddenSsid(p) => {
             draw_input(f, area, theme, "Hidden SSID", "", p.input.value(), false)
         }
-        Overlay::HiddenPass(p) => {
-            draw_input(f, area, theme, "Hidden password (blank = open)", &p.ssid, p.input.value(), true)
-        }
+        Overlay::HiddenPass(p) => draw_input(
+            f,
+            area,
+            theme,
+            "Hidden password (blank = open)",
+            &p.ssid,
+            p.input.value(),
+            true,
+        ),
         Overlay::Info => draw_info(f, area, theme, app.state.as_ref()),
         Overlay::Share(payload) => draw_share(f, area, theme, payload),
     }
@@ -67,7 +87,10 @@ fn draw_known_networks(f: &mut Frame, area: Rect, app: &mut App) {
     let rows: Vec<Row> = visible
         .iter()
         .map(|ssid| {
-            let net = app.networks.iter().find(|n| n.ssid.as_deref() == Some(ssid));
+            let net = app
+                .networks
+                .iter()
+                .find(|n| n.ssid.as_deref() == Some(ssid));
             let icon = if connected.as_deref() == Some(ssid) {
                 "󰖩 "
             } else {
@@ -203,14 +226,23 @@ fn draw_device(f: &mut Frame, area: Rect, app: &App) {
             let security = s
                 .ssid
                 .as_deref()
-                .and_then(|ssid| app.networks.iter().find(|n| n.ssid.as_deref() == Some(ssid)))
+                .and_then(|ssid| {
+                    app.networks
+                        .iter()
+                        .find(|n| n.ssid.as_deref() == Some(ssid))
+                })
                 .map(|n| sec_label(n.security).to_string())
                 .unwrap_or_else(|| "-".into());
             Row::new(vec![
                 Line::from(s.name.clone()).centered(),
                 Line::from("station").centered(),
                 Line::from(if s.powered { "On" } else { "Off" }).centered(),
-                Line::from(if s.ssid.is_some() { "connected" } else { "disconnected" }).centered(),
+                Line::from(if s.ssid.is_some() {
+                    "connected"
+                } else {
+                    "disconnected"
+                })
+                .centered(),
                 Line::from(if app.scanning { "Yes" } else { "No" }).centered(),
                 Line::from(band(s.channel)).centered(),
                 Line::from(security).centered(),
@@ -344,10 +376,7 @@ fn draw_help(f: &mut Frame, area: Rect, focus: Focus, theme: Theme) {
             ]),
         ],
     };
-    f.render_widget(
-        Paragraph::new(lines).centered().fg(theme.accent),
-        area,
-    );
+    f.render_widget(Paragraph::new(lines).centered().fg(theme.accent), area);
 }
 
 //
@@ -440,7 +469,15 @@ fn draw_notifications(f: &mut Frame, area: Rect, ns: &[Notification], theme: The
     f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
-fn draw_input(f: &mut Frame, area: Rect, theme: Theme, label: &str, ssid: &str, value: &str, mask: bool) {
+fn draw_input(
+    f: &mut Frame,
+    area: Rect,
+    theme: Theme,
+    label: &str,
+    ssid: &str,
+    value: &str,
+    mask: bool,
+) {
     let w = 60.min(area.width.saturating_sub(4));
     let h = 5;
     let rect = centered(area, w, h);
@@ -479,10 +516,22 @@ fn draw_info(f: &mut Frame, area: Rect, theme: Theme, state: Option<&InterfaceSt
     let lines: Vec<Line> = match state {
         Some(s) => vec![
             kv("interface", s.name.clone(), theme),
-            kv("powered", if s.powered { "ON".into() } else { "OFF".into() }, theme),
-            kv("hw addr", s.hw_address.clone().unwrap_or_else(|| "—".into()), theme),
+            kv(
+                "powered",
+                if s.powered { "ON".into() } else { "OFF".into() },
+                theme,
+            ),
+            kv(
+                "hw addr",
+                s.hw_address.clone().unwrap_or_else(|| "—".into()),
+                theme,
+            ),
             kv("SSID", s.ssid.clone().unwrap_or_else(|| "—".into()), theme),
-            kv("BSSID", s.bssid.clone().unwrap_or_else(|| "—".into()), theme),
+            kv(
+                "BSSID",
+                s.bssid.clone().unwrap_or_else(|| "—".into()),
+                theme,
+            ),
             kv("RSSI", format!("{} dBm", s.rssi), theme),
             kv("noise", format!("{} dBm", s.noise), theme),
             kv("tx rate", format!("{} Mbps", s.tx_rate), theme),
@@ -507,7 +556,10 @@ fn draw_info(f: &mut Frame, area: Rect, theme: Theme, state: Option<&InterfaceSt
 fn kv(k: &str, v: String, theme: Theme) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("  {:<10} ", k), style_fg(theme.muted)),
-        Span::styled(v, Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            v,
+            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+        ),
     ])
 }
 
@@ -533,7 +585,12 @@ fn draw_share(f: &mut Frame, area: Rect, theme: Theme, p: &SharePayload) {
     let qr_h = body_lines.len() as u16;
     let qr_w = body_lines
         .iter()
-        .map(|l| l.spans.iter().map(|s| s.content.chars().count()).sum::<usize>())
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.chars().count())
+                .sum::<usize>()
+        })
         .max()
         .unwrap_or(0) as u16;
     let w = (qr_w + 4).max(40).min(area.width.saturating_sub(2));

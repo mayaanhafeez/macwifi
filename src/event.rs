@@ -111,9 +111,8 @@ impl UiEventHandler {
                         CtEvent::Key(k) if k.kind == crossterm::event::KeyEventKind::Press => {
                             if tx.send(UiEvent::Key(k)).is_err() { break; }
                         }
-                        CtEvent::Resize(w, h) => {
-                            if tx.send(UiEvent::Resize(w, h)).is_err() { break; }
-                        }
+                        CtEvent::Resize(w, h)
+                            if tx.send(UiEvent::Resize(w, h)).is_err() => { break; }
                         _ => {}
                     }
                 }

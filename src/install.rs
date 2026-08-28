@@ -29,8 +29,7 @@ pub fn install() -> Result<()> {
 
     let plist_path = plist_path()?;
     if let Some(parent) = plist_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let plist = build_plist()?;
     std::fs::write(&plist_path, plist)
@@ -57,7 +56,11 @@ pub fn install() -> Result<()> {
             st.code().unwrap_or(-1)
         );
     }
-    println!("launchctl bootstrap {} {} → ok", domain, plist_path.display());
+    println!(
+        "launchctl bootstrap {} {} → ok",
+        domain,
+        plist_path.display()
+    );
 
     // Wait briefly for the daemon to bind the socket.
     let sock = crate::ipc::socket_path();

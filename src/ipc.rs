@@ -35,10 +35,7 @@ pub fn socket_path() -> PathBuf {
     base.join("macwifi").join("daemon.sock")
 }
 
-pub async fn write_line<W: AsyncWriteExt + Unpin, T: Serialize>(
-    w: &mut W,
-    v: &T,
-) -> Result<()> {
+pub async fn write_line<W: AsyncWriteExt + Unpin, T: Serialize>(w: &mut W, v: &T) -> Result<()> {
     let mut buf = serde_json::to_vec(v).context("serialize ipc message")?;
     buf.push(b'\n');
     w.write_all(&buf).await.context("socket write")?;

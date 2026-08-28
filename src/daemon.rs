@@ -32,8 +32,7 @@ pub async fn run() -> Result<()> {
     }
     // Remove stale socket from a prior run.
     let _ = tokio::fs::remove_file(&path).await;
-    let listener = UnixListener::bind(&path)
-        .with_context(|| format!("bind {}", path.display()))?;
+    let listener = UnixListener::bind(&path).with_context(|| format!("bind {}", path.display()))?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod 0600 {}", path.display()))?;
     crate::dlog!("listening at {}", path.display());
@@ -59,10 +58,7 @@ pub async fn run() -> Result<()> {
     });
 
     loop {
-        let (stream, _) = listener
-            .accept()
-            .await
-            .context("accept unix connection")?;
+        let (stream, _) = listener.accept().await.context("accept unix connection")?;
         let wifi = wifi.clone();
         let fanout = fanout.clone();
         tokio::spawn(async move {

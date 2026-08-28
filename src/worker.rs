@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::sync::mpsc::{self as std_mpsc, Sender};
 use std::thread;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::corewlan::{Security, WifiClient, WifiInterface};
@@ -77,12 +78,21 @@ pub fn join_request(ssid: String, password: String) -> Request {
 /// `app::WifiHandle`.
 #[derive(Clone)]
 pub struct LocalWifiHandle {
-    tx: Sender<Request>,
+    tx: Sender<Queued>,
+}
+
+/// A request plus the instant it entered the worker queue. The worker is a
+/// strict FIFO over one CoreWLAN thread, so the gap between these two points is
+/// exactly the latency an unrelated slow operation imposed on this request —
+/// the number Phase 1 of the scan performance work exists to expose.
+struct Queued {
+    req: Request,
+    enqueued: Instant,
 }
 
 impl LocalWifiHandle {
     pub fn spawn(events: UnboundedSender<Event>) -> Self {
-        let (tx, rx) = std_mpsc::channel::<Request>();
+        let (tx, rx) = std_mpsc::channel::<Queued>();
         thread::Builder::new()
             .name("wifi-worker".into())
             .spawn(move || worker_loop(rx, events))
@@ -91,7 +101,10 @@ impl LocalWifiHandle {
     }
 
     pub fn send(&self, req: Request) {
-        let _ = self.tx.send(req);
+        let _ = self.tx.send(Queued {
+            req,
+            enqueued: Instant::now(),
+        });
     }
 }
 
@@ -114,7 +127,7 @@ impl WifiHandle {
     }
 }
 
-fn worker_loop(rx: std_mpsc::Receiver<Request>, events: UnboundedSender<Event>) {
+fn worker_loop(rx: std_mpsc::Receiver<Queued>, events: UnboundedSender<Event>) {
     let client = match WifiClient::shared() {
         Ok(c) => c,
         Err(e) => {
@@ -132,13 +145,14 @@ fn worker_loop(rx: std_mpsc::Receiver<Request>, events: UnboundedSender<Event>) 
 
     emit_state(&iface, &events);
     emit_preferred(&iface, &events);
-    emit_scan(&iface, &events);
+    emit_scan(&iface, &events, Duration::ZERO);
 
-    while let Ok(req) = rx.recv() {
+    while let Ok(Queued { req, enqueued }) = rx.recv() {
+        let queue = enqueued.elapsed();
         match req {
             Request::RefreshState => emit_state(&iface, &events),
             Request::RefreshPreferred => emit_preferred(&iface, &events),
-            Request::Scan => emit_scan(&iface, &events),
+            Request::Scan => emit_scan(&iface, &events, queue),
             Request::SetPower(on) => {
                 if let Err(e) = iface.set_power(on) {
                     let name = iface.name();
@@ -301,11 +315,11 @@ fn emit_diagnose(iface: &WifiInterface, events: &UnboundedSender<Event>) {
     let scan = iface.scan().unwrap_or_default();
     let blank = scan
         .iter()
-        .filter(|n| n.ssid.as_deref().map_or(true, str::is_empty))
+        .filter(|n| n.ssid.as_deref().is_none_or(str::is_empty))
         .count();
     let location_auth_raw = unsafe {
         let mgr = objc2_core_location::CLLocationManager::new();
-        mgr.authorizationStatus().0 as i32
+        mgr.authorizationStatus().0
     };
     let pid = unsafe { libc::getpid() };
     let parent_pid = unsafe { libc::getppid() };
@@ -400,10 +414,10 @@ fn join_saved(iface: &WifiInterface, ssid: &str) -> Result<(), (JoinFailReason, 
 /// the Location grant, so the SSID readback isn't redacted here.)
 fn verify_join(iface: &WifiInterface, ssid: &str) -> bool {
     for _ in 0..20 {
-        if let Ok(st) = iface.state() {
-            if st.ssid.as_deref() == Some(ssid) {
-                return true;
-            }
+        if let Ok(st) = iface.state()
+            && st.ssid.as_deref() == Some(ssid)
+        {
+            return true;
         }
         thread::sleep(std::time::Duration::from_millis(500));
     }
@@ -452,14 +466,30 @@ fn share_uri(ssid: &str, security: ShareSecurity, password: Option<&str>) -> (St
     )
 }
 
-fn emit_scan(iface: &WifiInterface, events: &UnboundedSender<Event>) {
+fn emit_scan(iface: &WifiInterface, events: &UnboundedSender<Event>, queue: Duration) {
     let _ = events.send(Event::ScanStarted);
-    match iface.scan() {
+    let scan_start = Instant::now();
+    let result = iface.scan();
+    let corewlan = scan_start.elapsed();
+    let post_start = Instant::now();
+    match result {
         Ok(mut n) => {
             n.sort_by_key(|x| -x.rssi);
-            let all_blank = !n.is_empty()
-                && n.iter()
-                    .all(|x| x.ssid.as_deref().map_or(true, str::is_empty));
+            let blank = n
+                .iter()
+                .filter(|x| x.ssid.as_deref().is_none_or(str::is_empty))
+                .count();
+            let all_blank = !n.is_empty() && blank == n.len();
+            let postprocess = post_start.elapsed();
+            log_scan(
+                queue,
+                corewlan,
+                postprocess,
+                ScanLogOutcome::Ok {
+                    networks: n.len(),
+                    blank,
+                },
+            );
             let _ = events.send(Event::ScanResult(n));
             if all_blank {
                 if let Some(hint) = crate::location::redaction_hint() {
@@ -475,9 +505,35 @@ fn emit_scan(iface: &WifiInterface, events: &UnboundedSender<Event>) {
             }
         }
         Err(e) => {
+            log_scan(queue, corewlan, post_start.elapsed(), ScanLogOutcome::Error);
             let _ = events.send(Event::Error(format!("scan failed: {e}")));
         }
     }
+}
+
+enum ScanLogOutcome {
+    Ok { networks: usize, blank: usize },
+    Error,
+}
+
+/// One machine-readable line per scan so a slow sample can be attributed to
+/// worker queueing, CoreWLAN itself, or our own post-processing. `queue_ms` is
+/// time the request spent behind other worker operations; `corewlan_ms` is the
+/// synchronous `scanForNetworksWithName:` call we cannot cancel or speed up.
+fn log_scan(queue: Duration, corewlan: Duration, postprocess: Duration, outcome: ScanLogOutcome) {
+    let total = queue + corewlan + postprocess;
+    let (networks, blank, outcome) = match outcome {
+        ScanLogOutcome::Ok { networks, blank } => (networks, blank, "ok"),
+        ScanLogOutcome::Error => (0, 0, "error"),
+    };
+    dlog!(
+        "scan queue_ms={} corewlan_ms={} postprocess_ms={} total_ms={} \
+networks={networks} blank_ssids={blank} outcome={outcome}",
+        queue.as_millis(),
+        corewlan.as_millis(),
+        postprocess.as_millis(),
+        total.as_millis(),
+    );
 }
 
 #[cfg(test)]
