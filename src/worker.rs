@@ -127,6 +127,14 @@ impl WifiHandle {
     }
 }
 
+/// Work the worker performs before it accepts any client command.
+///
+/// Deliberately *excludes* `Request::Scan`. The daemon used to scan here, but
+/// nothing is subscribed yet at that point, so the result was discarded — and
+/// the client's own `send_init` scan then queued behind it, paying for a second
+/// physical scan. Initial scan demand belongs to whoever actually connects.
+const STARTUP_REQUESTS: &[Request] = &[Request::RefreshState, Request::RefreshPreferred];
+
 fn worker_loop(rx: std_mpsc::Receiver<Queued>, events: UnboundedSender<Event>) {
     let client = match WifiClient::shared() {
         Ok(c) => c,
@@ -143,168 +151,170 @@ fn worker_loop(rx: std_mpsc::Receiver<Queued>, events: UnboundedSender<Event>) {
         }
     };
 
-    emit_state(&iface, &events);
-    emit_preferred(&iface, &events);
-    emit_scan(&iface, &events, Duration::ZERO);
+    for req in STARTUP_REQUESTS {
+        dispatch(&iface, &events, req.clone(), Duration::ZERO);
+    }
 
     while let Ok(Queued { req, enqueued }) = rx.recv() {
         let queue = enqueued.elapsed();
-        match req {
-            Request::RefreshState => emit_state(&iface, &events),
-            Request::RefreshPreferred => emit_preferred(&iface, &events),
-            Request::Scan => emit_scan(&iface, &events, queue),
-            Request::SetPower(on) => {
-                if let Err(e) = iface.set_power(on) {
-                    let name = iface.name();
-                    if let Err(e2) = networksetup::set_power(&name, on) {
-                        let _ = events.send(Event::Error(format!(
-                            "power toggle failed: CoreWLAN={e}; networksetup={e2}"
-                        )));
-                    } else {
-                        let _ = events.send(Event::Notice(format!(
-                            "Wi-Fi {}",
-                            if on { "on" } else { "off" }
-                        )));
-                    }
+        dispatch(&iface, &events, req, queue);
+    }
+}
+
+/// Handle one worker request on the CoreWLAN thread.
+fn dispatch(iface: &WifiInterface, events: &UnboundedSender<Event>, req: Request, queue: Duration) {
+    match req {
+        Request::RefreshState => emit_state(iface, events),
+        Request::RefreshPreferred => emit_preferred(iface, events),
+        Request::Scan => emit_scan(iface, events, queue),
+        Request::SetPower(on) => {
+            if let Err(e) = iface.set_power(on) {
+                let name = iface.name();
+                if let Err(e2) = networksetup::set_power(&name, on) {
+                    let _ = events.send(Event::Error(format!(
+                        "power toggle failed: CoreWLAN={e}; networksetup={e2}"
+                    )));
                 } else {
                     let _ = events.send(Event::Notice(format!(
                         "Wi-Fi {}",
                         if on { "on" } else { "off" }
                     )));
                 }
-                emit_state(&iface, &events);
+            } else {
+                let _ = events.send(Event::Notice(format!(
+                    "Wi-Fi {}",
+                    if on { "on" } else { "off" }
+                )));
             }
-            Request::Associate(req) => {
-                let ssid = req.ssid.clone();
-                let result = match req.kind {
-                    AssociateKind::Open => iface.associate_open(&ssid),
-                    AssociateKind::Psk(p) => iface.associate_psk(&ssid, &p),
-                    AssociateKind::Peap { username, password } => {
-                        iface.associate_peap(&ssid, &username, &password)
-                    }
-                    AssociateKind::Hidden(pw) => match iface.scan_for_ssid(&ssid) {
-                        Ok(_) => match pw {
-                            Some(p) => iface.associate_psk(&ssid, &p),
-                            None => iface.associate_open(&ssid),
-                        },
-                        Err(e) => Err(e),
+            emit_state(iface, events);
+        }
+        Request::Associate(req) => {
+            let ssid = req.ssid.clone();
+            let result = match req.kind {
+                AssociateKind::Open => iface.associate_open(&ssid),
+                AssociateKind::Psk(p) => iface.associate_psk(&ssid, &p),
+                AssociateKind::Peap { username, password } => {
+                    iface.associate_peap(&ssid, &username, &password)
+                }
+                AssociateKind::Hidden(pw) => match iface.scan_for_ssid(&ssid) {
+                    Ok(_) => match pw {
+                        Some(p) => iface.associate_psk(&ssid, &p),
+                        None => iface.associate_open(&ssid),
                     },
-                };
-                match result {
-                    Ok(()) => {
+                    Err(e) => Err(e),
+                },
+            };
+            match result {
+                Ok(()) => {
+                    let _ = events.send(Event::Notice(format!("connected to {ssid}")));
+                }
+                Err(e) => {
+                    let _ = events.send(Event::Error(format!("connect failed: {e}")));
+                }
+            }
+            emit_state(iface, events);
+            emit_preferred(iface, events);
+        }
+        Request::JoinWithPassword { ssid, password } => {
+            let name = iface.name();
+            match networksetup::set_airport_network(&name, &ssid, Some(&password)) {
+                Ok(()) => {
+                    // Cache our own copy as soon as networksetup accepts the
+                    // password — do NOT gate this on verify_join. Association
+                    // + DHCP can lag the command's return by several seconds,
+                    // and a slow-but-successful join used to leave nothing
+                    // cached, forcing another prompt next time. A genuinely
+                    // wrong password self-corrects: the next JoinSaved fails
+                    // with AssociationFailed and re-prompts, overwriting this.
+                    if let Err(e) = keychain::cache_password(&ssid, &password) {
+                        dlog!("cache_password({ssid}) failed: {e:#}");
+                    } else {
+                        dlog!("cached password for {ssid}");
+                    }
+                    if verify_join(iface, &ssid) {
                         let _ = events.send(Event::Notice(format!("connected to {ssid}")));
+                    } else {
+                        dlog!("join to {ssid}: networksetup ok but association unconfirmed");
+                        let _ = events.send(Event::Notice(format!(
+                            "join to {ssid} sent — association not yet confirmed, it may still complete"
+                        )));
                     }
+                }
+                Err(e) => {
+                    dlog!("join to {ssid} failed: {e:#}");
+                    let _ = events.send(Event::Error(format!("join failed: {e}")));
+                }
+            }
+            emit_state(iface, events);
+        }
+        Request::JoinSaved(ssid) => {
+            // Silent-reconnect strategy. Each failure is classified so the
+            // client can decide whether to re-prompt for a password (a real
+            // credential problem) or just show a toast (network simply out of
+            // range). We deliberately do NOT read the System keychain here —
+            // its AirPort item is walled off by a partition-list ACL even from
+            // root (the -25293 finding; see keychain.rs) so it would only fire
+            // a useless admin dialog. macwifi's own login-keychain cache is the
+            // only silent path for secured networks.
+            let outcome = join_saved(iface, &ssid);
+            match outcome {
+                Ok(()) => {
+                    dlog!("reconnected to {ssid}");
+                    let _ = events.send(Event::Notice(format!("connected to {ssid}")));
+                }
+                Err((reason, detail)) => {
+                    dlog!("JoinSaved({ssid}) failed: {reason:?} — {detail}");
+                    let _ = events.send(Event::JoinSavedFailed {
+                        ssid,
+                        reason,
+                        detail,
+                    });
+                }
+            }
+            emit_state(iface, events);
+        }
+        Request::Disconnect => {
+            iface.disassociate();
+            let _ = events.send(Event::Notice("disconnected".into()));
+            emit_state(iface, events);
+        }
+        Request::Share { ssid, security } => {
+            let password = match security {
+                ShareSecurity::Nopass => None,
+                ShareSecurity::Wpa | ShareSecurity::Wep => match keychain::share_password(&ssid) {
+                    Ok(password) => Some(password),
                     Err(e) => {
-                        let _ = events.send(Event::Error(format!("connect failed: {e}")));
+                        let _ =
+                            events.send(Event::Error(format!("keychain: {e} — sharing SSID only")));
+                        None
                     }
+                },
+            };
+            let (uri, has_pw) = share_uri(&ssid, security, password.as_deref());
+            let _ = events.send(Event::ShareReady(SharePayload {
+                schema_version: 1,
+                ssid,
+                uri,
+                has_password: has_pw,
+            }));
+        }
+        Request::Forget(ssid) => {
+            let name = iface.name();
+            // Drop our cached login-keychain copy too, so a forgotten
+            // network doesn't silently reconnect from our cache later.
+            let _ = keychain::forget_cached(&ssid);
+            match networksetup::remove_preferred(&name, &ssid) {
+                Ok(()) => {
+                    let _ = events.send(Event::Notice(format!("forgot {ssid}")));
                 }
-                emit_state(&iface, &events);
-                emit_preferred(&iface, &events);
-            }
-            Request::JoinWithPassword { ssid, password } => {
-                let name = iface.name();
-                match networksetup::set_airport_network(&name, &ssid, Some(&password)) {
-                    Ok(()) => {
-                        // Cache our own copy as soon as networksetup accepts the
-                        // password — do NOT gate this on verify_join. Association
-                        // + DHCP can lag the command's return by several seconds,
-                        // and a slow-but-successful join used to leave nothing
-                        // cached, forcing another prompt next time. A genuinely
-                        // wrong password self-corrects: the next JoinSaved fails
-                        // with AssociationFailed and re-prompts, overwriting this.
-                        if let Err(e) = keychain::cache_password(&ssid, &password) {
-                            dlog!("cache_password({ssid}) failed: {e:#}");
-                        } else {
-                            dlog!("cached password for {ssid}");
-                        }
-                        if verify_join(&iface, &ssid) {
-                            let _ = events.send(Event::Notice(format!("connected to {ssid}")));
-                        } else {
-                            dlog!("join to {ssid}: networksetup ok but association unconfirmed");
-                            let _ = events.send(Event::Notice(format!(
-                                "join to {ssid} sent — association not yet confirmed, it may still complete"
-                            )));
-                        }
-                    }
-                    Err(e) => {
-                        dlog!("join to {ssid} failed: {e:#}");
-                        let _ = events.send(Event::Error(format!("join failed: {e}")));
-                    }
+                Err(e) => {
+                    let _ = events.send(Event::Error(format!("forget failed: {e}")));
                 }
-                emit_state(&iface, &events);
             }
-            Request::JoinSaved(ssid) => {
-                // Silent-reconnect strategy. Each failure is classified so the
-                // client can decide whether to re-prompt for a password (a real
-                // credential problem) or just show a toast (network simply out of
-                // range). We deliberately do NOT read the System keychain here —
-                // its AirPort item is walled off by a partition-list ACL even from
-                // root (the -25293 finding; see keychain.rs) so it would only fire
-                // a useless admin dialog. macwifi's own login-keychain cache is the
-                // only silent path for secured networks.
-                let outcome = join_saved(&iface, &ssid);
-                match outcome {
-                    Ok(()) => {
-                        dlog!("reconnected to {ssid}");
-                        let _ = events.send(Event::Notice(format!("connected to {ssid}")));
-                    }
-                    Err((reason, detail)) => {
-                        dlog!("JoinSaved({ssid}) failed: {reason:?} — {detail}");
-                        let _ = events.send(Event::JoinSavedFailed {
-                            ssid,
-                            reason,
-                            detail,
-                        });
-                    }
-                }
-                emit_state(&iface, &events);
-            }
-            Request::Disconnect => {
-                iface.disassociate();
-                let _ = events.send(Event::Notice("disconnected".into()));
-                emit_state(&iface, &events);
-            }
-            Request::Share { ssid, security } => {
-                let password = match security {
-                    ShareSecurity::Nopass => None,
-                    ShareSecurity::Wpa | ShareSecurity::Wep => {
-                        match keychain::share_password(&ssid) {
-                            Ok(password) => Some(password),
-                            Err(e) => {
-                                let _ = events.send(Event::Error(format!(
-                                    "keychain: {e} — sharing SSID only"
-                                )));
-                                None
-                            }
-                        }
-                    }
-                };
-                let (uri, has_pw) = share_uri(&ssid, security, password.as_deref());
-                let _ = events.send(Event::ShareReady(SharePayload {
-                    schema_version: 1,
-                    ssid,
-                    uri,
-                    has_password: has_pw,
-                }));
-            }
-            Request::Forget(ssid) => {
-                let name = iface.name();
-                // Drop our cached login-keychain copy too, so a forgotten
-                // network doesn't silently reconnect from our cache later.
-                let _ = keychain::forget_cached(&ssid);
-                match networksetup::remove_preferred(&name, &ssid) {
-                    Ok(()) => {
-                        let _ = events.send(Event::Notice(format!("forgot {ssid}")));
-                    }
-                    Err(e) => {
-                        let _ = events.send(Event::Error(format!("forget failed: {e}")));
-                    }
-                }
-                emit_preferred(&iface, &events);
-            }
-            Request::Diagnose => {
-                emit_diagnose(&iface, &events);
-            }
+            emit_preferred(iface, events);
+        }
+        Request::Diagnose => {
+            emit_diagnose(iface, events);
         }
     }
 }
@@ -539,6 +549,30 @@ networks={networks} blank_ssids={blank} outcome={outcome}",
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_does_not_scan() {
+        // A scan here would be thrown away (no client is subscribed yet) and
+        // would queue ahead of the connecting client's own scan.
+        assert!(
+            !STARTUP_REQUESTS.iter().any(|r| matches!(r, Request::Scan)),
+            "worker startup must not perform a physical scan"
+        );
+    }
+
+    #[test]
+    fn startup_primes_state_and_preferred() {
+        assert!(
+            STARTUP_REQUESTS
+                .iter()
+                .any(|r| matches!(r, Request::RefreshState))
+        );
+        assert!(
+            STARTUP_REQUESTS
+                .iter()
+                .any(|r| matches!(r, Request::RefreshPreferred))
+        );
+    }
 
     #[test]
     fn blank_password_creates_open_association_request() {
