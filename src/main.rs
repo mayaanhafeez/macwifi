@@ -10,9 +10,7 @@ use macwifi::config::Config;
 use macwifi::corewlan::Security;
 use macwifi::event::{Event, UiEvent, UiEventHandler};
 use macwifi::handler;
-use macwifi::speedtest::{
-    SpeedtestEvent, SpeedtestOptions, SpeedtestProvider, SpeedtestResult,
-};
+use macwifi::speedtest::{SpeedtestEvent, SpeedtestOptions, SpeedtestProvider, SpeedtestResult};
 use macwifi::terminal::Tui;
 use macwifi::theme;
 use macwifi::ui;
@@ -51,6 +49,16 @@ enum Cmd {
     },
     Disconnect,
     Preferred,
+    /// Produce a standard Wi-Fi sharing URI for QR-code generators and apps.
+    Share {
+        ssid: String,
+        /// Network security type.
+        #[arg(long, value_enum, default_value_t = ShareSecurityArg::Wpa)]
+        security: ShareSecurityArg,
+        /// Machine-readable output containing the schema version and URI.
+        #[arg(long)]
+        json: bool,
+    },
     Forget {
         ssid: String,
     },
@@ -89,6 +97,23 @@ enum Cmd {
 enum PowerState {
     On,
     Off,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ShareSecurityArg {
+    Wpa,
+    Wep,
+    Open,
+}
+
+impl From<ShareSecurityArg> for ShareSecurity {
+    fn from(value: ShareSecurityArg) -> Self {
+        match value {
+            ShareSecurityArg::Wpa => Self::Wpa,
+            ShareSecurityArg::Wep => Self::Wep,
+            ShareSecurityArg::Open => Self::Nopass,
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -233,7 +258,9 @@ async fn run_cli(cmd: Cmd) -> Result<()> {
                     println!("tx rate   : {} Mbps", s.tx_rate);
                     println!(
                         "channel   : {}",
-                        s.channel.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
+                        s.channel
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "-".into()),
                     );
                 }
             }
@@ -320,6 +347,32 @@ async fn run_cli(cmd: Cmd) -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Share {
+            ssid,
+            security,
+            json,
+        } => {
+            let evs = cli_one_shot(
+                Request::Share {
+                    ssid,
+                    security: security.into(),
+                },
+                |e| matches!(e, Event::ShareReady(_) | Event::Error(_)),
+            )
+            .await?;
+            match evs.last() {
+                Some(Event::ShareReady(payload)) if json => {
+                    println!("{}", serde_json::to_string(payload)?);
+                    Ok(())
+                }
+                Some(Event::ShareReady(payload)) => {
+                    println!("{}", payload.uri);
+                    Ok(())
+                }
+                Some(Event::Error(message)) => Err(anyhow::anyhow!(message.clone())),
+                _ => Err(anyhow::anyhow!("daemon returned no share payload")),
+            }
+        }
         Cmd::Forget { ssid } => {
             let evs = cli_one_shot(Request::Forget(ssid), is_notice_or_error).await?;
             print_terminal_event(&evs);
@@ -327,7 +380,6 @@ async fn run_cli(cmd: Cmd) -> Result<()> {
         }
         Cmd::Themes | Cmd::InstallDaemon | Cmd::UninstallDaemon => unreachable!(),
         Cmd::Diagnose => run_diagnose().await,
-        // ShareReady never comes from the CLI; placeholder for completeness.
     }
 }
 
@@ -443,7 +495,10 @@ async fn run_diagnose() -> Result<()> {
             "location auth     : {status:?}  (0=notDet 1=restr 2=denied 3=always 4=whenInUse)"
         );
     }
-    println!("socket path       : {}", macwifi::ipc::socket_path().display());
+    println!(
+        "socket path       : {}",
+        macwifi::ipc::socket_path().display()
+    );
     println!();
     println!("== macwifi diagnose (daemon) ==");
     match cli_one_shot(Request::Diagnose, |e| matches!(e, Event::DaemonDiagnose(_))).await {
@@ -489,6 +544,3 @@ fn sec_label(s: Security) -> &'static str {
         Security::Unknown => "?",
     }
 }
-
-#[allow(dead_code)]
-fn _suppress_unused(_: ShareSecurity) {}

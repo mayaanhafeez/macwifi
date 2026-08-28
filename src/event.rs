@@ -58,6 +58,7 @@ pub enum JoinFailReason {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SharePayload {
+    pub schema_version: u32,
     pub ssid: String,
     pub uri: String,
     pub has_password: bool,
