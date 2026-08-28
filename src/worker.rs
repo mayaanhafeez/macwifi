@@ -4,9 +4,9 @@
 //! drive it via a `std::sync::mpsc` request channel. Responses flow back as
 //! `Event` values on the shared tokio channel the UI reads from.
 
+use serde::{Deserialize, Serialize};
 use std::sync::mpsc::{self as std_mpsc, Sender};
 use std::thread;
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::corewlan::{Security, WifiClient, WifiInterface};
@@ -27,8 +27,14 @@ pub enum Request {
     Disconnect,
     Forget(String),
     JoinSaved(String),
-    JoinWithPassword { ssid: String, password: String },
-    Share { ssid: String, security: ShareSecurity },
+    JoinWithPassword {
+        ssid: String,
+        password: String,
+    },
+    Share {
+        ssid: String,
+        security: ShareSecurity,
+    },
     Diagnose,
 }
 
@@ -141,8 +147,10 @@ fn worker_loop(rx: std_mpsc::Receiver<Request>, events: UnboundedSender<Event>) 
                             "power toggle failed: CoreWLAN={e}; networksetup={e2}"
                         )));
                     } else {
-                        let _ =
-                            events.send(Event::Notice(format!("Wi-Fi {}", if on { "on" } else { "off" })));
+                        let _ = events.send(Event::Notice(format!(
+                            "Wi-Fi {}",
+                            if on { "on" } else { "off" }
+                        )));
                     }
                 } else {
                     let _ = events.send(Event::Notice(format!(
@@ -243,39 +251,23 @@ fn worker_loop(rx: std_mpsc::Receiver<Request>, events: UnboundedSender<Event>) 
                 emit_state(&iface, &events);
             }
             Request::Share { ssid, security } => {
-                let (uri, has_pw) = match security {
-                    ShareSecurity::Nopass => (
-                        format!("WIFI:T:nopass;S:{};;", escape_wifi(&ssid)),
-                        false,
-                    ),
+                let password = match security {
+                    ShareSecurity::Nopass => None,
                     ShareSecurity::Wpa | ShareSecurity::Wep => {
-                        let t = match security {
-                            ShareSecurity::Wep => "WEP",
-                            _ => "WPA",
-                        };
-                        match keychain::wifi_password(&ssid) {
-                            Ok(pw) => (
-                                format!(
-                                    "WIFI:T:{};S:{};P:{};;",
-                                    t,
-                                    escape_wifi(&ssid),
-                                    escape_wifi(&pw)
-                                ),
-                                true,
-                            ),
+                        match keychain::share_password(&ssid) {
+                            Ok(password) => Some(password),
                             Err(e) => {
                                 let _ = events.send(Event::Error(format!(
                                     "keychain: {e} — sharing SSID only"
                                 )));
-                                (
-                                    format!("WIFI:T:nopass;S:{};;", escape_wifi(&ssid)),
-                                    false,
-                                )
+                                None
                             }
                         }
                     }
                 };
+                let (uri, has_pw) = share_uri(&ssid, security, password.as_deref());
                 let _ = events.send(Event::ShareReady(SharePayload {
+                    schema_version: 1,
                     ssid,
                     uri,
                     has_password: has_pw,
@@ -441,6 +433,25 @@ fn escape_wifi(s: &str) -> String {
     out
 }
 
+fn share_uri(ssid: &str, security: ShareSecurity, password: Option<&str>) -> (String, bool) {
+    let Some(password) = password else {
+        return (format!("WIFI:T:nopass;S:{};;", escape_wifi(ssid)), false);
+    };
+    let security = match security {
+        ShareSecurity::Wep => "WEP",
+        ShareSecurity::Wpa => "WPA",
+        ShareSecurity::Nopass => "nopass",
+    };
+    (
+        format!(
+            "WIFI:T:{security};S:{};P:{};;",
+            escape_wifi(ssid),
+            escape_wifi(password)
+        ),
+        true,
+    )
+}
+
 fn emit_scan(iface: &WifiInterface, events: &UnboundedSender<Event>) {
     let _ = events.send(Event::ScanStarted);
     match iface.scan() {
@@ -484,6 +495,22 @@ mod tests {
                 kind: AssociateKind::Open,
             }) if ssid == "Airport WiFi"
         ));
+    }
+
+    #[test]
+    fn share_uri_escapes_reserved_characters() {
+        let (uri, has_password) = share_uri("Cafe;WiFi", ShareSecurity::Wpa, Some("a:b\\c"));
+
+        assert_eq!(uri, "WIFI:T:WPA;S:Cafe\\;WiFi;P:a\\:b\\\\c;;");
+        assert!(has_password);
+    }
+
+    #[test]
+    fn share_uri_without_password_is_open() {
+        let (uri, has_password) = share_uri("Cafe", ShareSecurity::Wpa, None);
+
+        assert_eq!(uri, "WIFI:T:nopass;S:Cafe;;");
+        assert!(!has_password);
     }
 
     #[test]

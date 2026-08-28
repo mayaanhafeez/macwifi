@@ -2,10 +2,11 @@
 //!
 //! macOS stores Wi-Fi passwords in `/Library/Keychains/System.keychain` as
 //! generic-password items with `service="AirPort"`, `account=<SSID>`. The
-//! authoritative copy lives there — we deliberately do NOT duplicate it
-//! into the login keychain.
+//! authoritative copy lives there. Passwords entered through macwifi are also
+//! cached in an app-owned login-keychain item for silent reconnect/share.
 //!
-//! Each read of a saved network's password triggers a macOS admin-auth prompt.
+//! Each System keychain read of a saved network's password triggers a macOS
+//! admin-auth prompt.
 //! There is no persistent silent path for a third-party process: macOS enforces
 //! these items' partition-list ACLs by the caller's code identity (not uid), so
 //! the grant can't be made to stick — a spike confirmed even a root process gets
@@ -40,6 +41,19 @@ pub fn wifi_password(ssid: &str) -> Result<String> {
     let bytes = get_generic_password(WIFI_SERVICE, ssid)
         .with_context(|| format!("system keychain lookup for {ssid}"))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Return the app-owned cached password when available. A network first saved
+/// outside macwifi has no cache, so read the protected System keychain once and
+/// populate our cache for later reconnect and share requests.
+pub fn share_password(ssid: &str) -> Result<String> {
+    if let Some(password) = cached_password(ssid)? {
+        return Ok(password);
+    }
+
+    let password = wifi_password(ssid)?;
+    cache_password(ssid, &password)?;
+    Ok(password)
 }
 
 /// Store macwifi's own copy of `ssid`'s password in the login keychain so future

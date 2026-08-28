@@ -14,6 +14,7 @@ Station mode only. Theming, hidden networks, QR sharing, adapter info, and a
 - Manage saved networks (list, remove) and the current connection (disconnect, toggle power)
 - **Silent reconnect**: the password you type on first connect is cached in macwifi's own login-keychain item, so reconnecting to a saved network is promptless (see [Passwords & prompts](#passwords--prompts))
 - QR-code sharing of saved networks (reads the password from the System keychain — triggers one macOS admin-auth prompt per share)
+- Process API for Wi-Fi share URIs so other apps can render or transmit QR codes
 - Adapter info popup: SSID, BSSID, RSSI, noise, channel, TX rate, MAC
 - Download, upload, and latency tests with Apple, Ookla, Netflix, or custom providers
 - **14 themes**: `default`, Catppuccin (latte/frappe/macchiato/mocha), Rose Pine (main/moon/dawn), Tokyo Night (night/storm), Gruvbox (dark/light), Nord, Dracula
@@ -471,9 +472,42 @@ the System keychain for everyday use:
   reconnects with no prompt. If there's no cache (e.g. a network saved outside
   macwifi), it tries the system auto-join, and only asks for the password if
   that fails.
-- **QR-share** — the one exception. It reads the password from the *System*
-  keychain, which triggers **one admin-auth dialog per share**. Unavoidable for
-  any third-party app.
+- **QR-share** — it first reads macwifi's app-owned cache silently. For a
+  network saved outside macwifi, the first share reads the *System* keychain,
+  triggers an admin-auth dialog, and caches the result. Later shares are silent.
+
+### Wi-Fi share process API
+
+Other apps can request the standard `WIFI:` payload through the existing
+same-user daemon API:
+
+```sh
+# WPA/WPA2/WPA3 Personal (default)
+macwifi share "Home WiFi"
+
+# Versioned JSON for applications
+macwifi share "Home WiFi" --json
+
+# WEP or open networks
+macwifi share "Legacy WiFi" --security wep --json
+macwifi share "Cafe WiFi" --security open --json
+```
+
+The plain command writes only the URI to stdout:
+
+```text
+WIFI:T:WPA;S:Home WiFi;P:correct horse battery staple;;
+```
+
+JSON output is a single object suitable for subprocess integrations:
+
+```json
+{"schema_version":1,"ssid":"Home WiFi","uri":"WIFI:T:WPA;S:Home WiFi;P:correct horse battery staple;;","has_password":true}
+```
+
+The URI contains the password and must be treated as a secret. The daemon only
+accepts Unix-socket clients running as the same macOS user. macwifi does not
+open an HTTP port or expose this API to the network.
 
 This means macwifi keeps a second, app-scoped copy of each password you connect
 with (in your login keychain). `Forget` deletes both the saved network and
@@ -540,10 +574,11 @@ re-enter each password once more, after which reconnects are silent again.
 
 **Admin-password dialog when sharing a QR code**
 
-Expected. QR-share reads the password from the *System* keychain, which macOS
-guards with an admin-auth prompt for any third-party app — there is no silent
-path (not even as root). Enter your login password to continue, or cancel to
-share the SSID without the password. See `ARCHITECTURE_PASSWORDS.md` for why.
+Expected on the first share when the network was saved outside macwifi. The
+System keychain read requires admin authentication; after a successful read,
+macwifi stores an app-owned copy and later shares are silent. Cancelling shares
+the SSID without a password. See `ARCHITECTURE_PASSWORDS.md` for why the first
+protected read cannot be avoided.
 
 **Full diagnostics**
 
