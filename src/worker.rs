@@ -97,7 +97,35 @@ pub enum WorkerCommand {
     /// operation id rather than an origin because one sweep may be answering
     /// any number of clients — the coordinator, not the worker, knows who.
     Scan { operation_id: u64 },
+    /// One more check that a join took effect. Each is a single cheap state
+    /// read; the waiting between them happens on the daemon's runtime.
+    VerifyJoin {
+        origin: Option<Origin>,
+        ssid: String,
+        kind: JoinKind,
+        attempts_remaining: u8,
+    },
 }
+
+/// Which join produced the association being confirmed. The two report an
+/// unconfirmed association differently — and the client reacts differently, one
+/// re-prompting for a password and the other not — so the distinction has to
+/// survive the hop out to the timer and back.
+#[derive(Debug, Clone)]
+pub enum JoinKind {
+    /// A `networksetup` join with a password the user just entered.
+    Password,
+    /// A silent reconnect to a saved network, carrying the detail its
+    /// `JoinSavedFailed` will report if the association never confirms.
+    Saved { fail_detail: String },
+}
+
+/// How many times a join is checked before it is called unconfirmed.
+/// Association and DHCP can lag `networksetup`'s return by several seconds.
+const VERIFY_ATTEMPTS: u8 = 20;
+
+/// How long the daemon waits between verification checks.
+pub const VERIFY_INTERVAL: Duration = Duration::from_millis(500);
 
 /// What the CoreWLAN thread reports back.
 #[derive(Debug, Clone)]
@@ -110,6 +138,15 @@ pub enum WorkerEvent {
         operation_id: u64,
         result: Result<Vec<ScannedNetwork>, String>,
         timings: ScanTimings,
+    },
+    /// The worker wants another verification check after `VERIFY_INTERVAL`.
+    /// The worker cannot sleep on it — that is the whole point — so it asks
+    /// the daemon to sleep and re-enqueue.
+    ScheduleVerify {
+        origin: Option<Origin>,
+        ssid: String,
+        kind: JoinKind,
+        attempts_remaining: u8,
     },
 }
 
@@ -160,6 +197,15 @@ impl Emitter {
         let _ = self.tx.send(WorkerEvent::Emit {
             origin: self.origin,
             event,
+        });
+    }
+
+    fn schedule_verify(&self, ssid: String, kind: JoinKind, attempts_remaining: u8) {
+        let _ = self.tx.send(WorkerEvent::ScheduleVerify {
+            origin: self.origin,
+            ssid,
+            kind,
+            attempts_remaining,
         });
     }
 }
@@ -275,6 +321,18 @@ fn worker_loop(rx: std_mpsc::Receiver<Queued>, events: UnboundedSender<WorkerEve
                 };
                 dispatch(&iface, &emitter, request, queue);
             }
+            WorkerCommand::VerifyJoin {
+                origin,
+                ssid,
+                kind,
+                attempts_remaining,
+            } => {
+                let emitter = Emitter {
+                    tx: events.clone(),
+                    origin,
+                };
+                check_join(&iface, &emitter, ssid, kind, attempts_remaining);
+            }
             WorkerCommand::Scan { operation_id } => {
                 let (result, timings) = run_scan(&iface, queue);
                 let _ = events.send(WorkerEvent::ScanFinished {
@@ -357,21 +415,17 @@ fn dispatch(iface: &WifiInterface, events: &Emitter, req: Request, queue: Durati
                     } else {
                         dlog!("cached password for {ssid}");
                     }
-                    if verify_join(iface, &ssid) {
-                        events.send(Event::Notice(format!("connected to {ssid}")));
-                    } else {
-                        dlog!("join to {ssid}: networksetup ok but association unconfirmed");
-                        events.send(Event::Notice(format!(
-                            "join to {ssid} sent — association not yet confirmed, it may still complete"
-                        )));
-                    }
+                    // Verification continues asynchronously: the worker must
+                    // not sit on the CoreWLAN thread for ten seconds while
+                    // every other request — a scan above all — waits behind it.
+                    begin_verify(iface, events, ssid, JoinKind::Password);
                 }
                 Err(e) => {
                     dlog!("join to {ssid} failed: {e:#}");
                     events.send(Event::Error(format!("join failed: {e}")));
+                    emit_state(iface, events);
                 }
             }
-            emit_state(iface, events);
         }
         Request::JoinSaved(ssid) => {
             // Silent-reconnect strategy. Each failure is classified so the
@@ -382,22 +436,20 @@ fn dispatch(iface: &WifiInterface, events: &Emitter, req: Request, queue: Durati
             // root (the -25293 finding; see keychain.rs) so it would only fire
             // a useless admin dialog. macwifi's own login-keychain cache is the
             // only silent path for secured networks.
-            let outcome = join_saved(iface, &ssid);
-            match outcome {
-                Ok(()) => {
-                    dlog!("reconnected to {ssid}");
-                    events.send(Event::Notice(format!("connected to {ssid}")));
+            match join_saved(iface, &ssid) {
+                JoinSavedOutcome::Verify { fail_detail } => {
+                    begin_verify(iface, events, ssid, JoinKind::Saved { fail_detail });
                 }
-                Err((reason, detail)) => {
+                JoinSavedOutcome::Failed(reason, detail) => {
                     dlog!("JoinSaved({ssid}) failed: {reason:?} — {detail}");
                     events.send(Event::JoinSavedFailed {
                         ssid,
                         reason,
                         detail,
                     });
+                    emit_state(iface, events);
                 }
             }
-            emit_state(iface, events);
         }
         Request::Disconnect => {
             iface.disassociate();
@@ -484,79 +536,158 @@ fn emit_state(iface: &WifiInterface, events: &Emitter) {
     }
 }
 
+/// What a `JoinSaved` attempt reached before any confirmation.
+enum JoinSavedOutcome {
+    /// An association was issued; whether it took effect is not yet known.
+    /// Carries the detail to report if it never confirms.
+    Verify { fail_detail: String },
+    /// Failed outright, with no association attempted or one that CoreWLAN
+    /// rejected immediately.
+    Failed(JoinFailReason, String),
+}
+
 /// Try to silently reconnect to a saved network. Returns the specific reason on
 /// failure so the client can react appropriately (re-prompt vs. toast). Never
 /// falls back to a blind `associate_open` on a secured network: CoreWLAN's
 /// nil-password associate does not consult saved credentials, so it can't help
 /// and may tear down an association we just started.
-fn join_saved(iface: &WifiInterface, ssid: &str) -> Result<(), (JoinFailReason, String)> {
+fn join_saved(iface: &WifiInterface, ssid: &str) -> JoinSavedOutcome {
     // Is it even in range? A directed scan is the authoritative check and also
     // tells us the security type. `find_network`-style empty result ⇒ out of
     // range, which is not a credential problem.
-    let scan = iface.scan_for_ssid(ssid).map_err(|e| {
-        (
-            JoinFailReason::NotInRange,
-            format!("directed scan failed: {e}"),
-        )
-    })?;
-    let net = scan.into_iter().next().ok_or_else(|| {
-        (
+    let scan = match iface.scan_for_ssid(ssid) {
+        Ok(scan) => scan,
+        Err(e) => {
+            return JoinSavedOutcome::Failed(
+                JoinFailReason::NotInRange,
+                format!("directed scan failed: {e}"),
+            );
+        }
+    };
+    let Some(net) = scan.into_iter().next() else {
+        return JoinSavedOutcome::Failed(
             JoinFailReason::NotInRange,
             "network not visible in scan".to_string(),
-        )
-    })?;
+        );
+    };
 
     // Open networks need no credential.
     if net.security == Security::Open {
-        return if iface.associate_open(ssid).is_ok() && verify_join(iface, ssid) {
-            Ok(())
+        let detail = "open associate did not take effect".to_string();
+        return if iface.associate_open(ssid).is_ok() {
+            JoinSavedOutcome::Verify {
+                fail_detail: detail,
+            }
         } else {
-            Err((
-                JoinFailReason::AssociationFailed,
-                "open associate did not take effect".to_string(),
-            ))
+            JoinSavedOutcome::Failed(JoinFailReason::AssociationFailed, detail)
         };
     }
 
     // Secured: use macwifi's own cached password if we have one.
     match keychain::cached_password(ssid) {
         Ok(Some(pw)) => {
-            if iface.associate_psk(ssid, &pw).is_ok() && verify_join(iface, ssid) {
-                Ok(())
+            let detail = "cached password did not associate".to_string();
+            if iface.associate_psk(ssid, &pw).is_ok() {
+                JoinSavedOutcome::Verify {
+                    fail_detail: detail,
+                }
             } else {
-                Err((
-                    JoinFailReason::AssociationFailed,
-                    "cached password did not associate".to_string(),
-                ))
+                JoinSavedOutcome::Failed(JoinFailReason::AssociationFailed, detail)
             }
         }
-        Ok(None) => Err((
+        Ok(None) => JoinSavedOutcome::Failed(
             JoinFailReason::NoCachedCredential,
             "no saved credential in macwifi cache".to_string(),
-        )),
+        ),
         // cached_password already deleted the poisoned item; a re-entered
         // password will recreate it cleanly.
-        Err(e) => Err((JoinFailReason::KeychainDenied, format!("{e:#}"))),
+        Err(e) => JoinSavedOutcome::Failed(JoinFailReason::KeychainDenied, format!("{e:#}")),
     }
 }
 
-/// Confirm a `networksetup`-driven join actually took effect, independent of
-/// locale. `networksetup -setairportnetwork` exits 0 and prints a *localized*
-/// "Failed…" line on auth/password errors, so the only trustworthy signal is
-/// reading back the interface's current SSID via CoreWLAN. Association + DHCP
-/// can lag the command's return by several seconds, so poll for up to 10s. This
-/// early-exits on success, so a fast join returns immediately. (The daemon holds
-/// the Location grant, so the SSID readback isn't redacted here.)
-fn verify_join(iface: &WifiInterface, ssid: &str) -> bool {
-    for _ in 0..20 {
-        if let Ok(st) = iface.state()
-            && st.ssid.as_deref() == Some(ssid)
-        {
-            return true;
+/// What to do after one verification check. Split out from the CoreWLAN call
+/// so the retry budget can be tested without a radio.
+#[derive(Debug, PartialEq, Eq)]
+enum VerifyStep {
+    Joined,
+    Retry { attempts_remaining: u8 },
+    GiveUp,
+}
+
+fn verify_step(joined: bool, attempts_remaining: u8) -> VerifyStep {
+    if joined {
+        VerifyStep::Joined
+    } else if attempts_remaining > 0 {
+        VerifyStep::Retry {
+            attempts_remaining: attempts_remaining - 1,
         }
-        thread::sleep(std::time::Duration::from_millis(500));
+    } else {
+        VerifyStep::GiveUp
     }
-    false
+}
+
+/// The event a join that never confirmed should report.
+///
+/// The two kinds differ deliberately: an unconfirmed `JoinWithPassword` is a
+/// notice, because `networksetup` accepted the password and the association may
+/// still land, while an unconfirmed `JoinSaved` is a failure the client answers
+/// by prompting for a password.
+fn verify_failure_event(ssid: String, kind: JoinKind) -> Event {
+    match kind {
+        JoinKind::Password => Event::Notice(format!(
+            "join to {ssid} sent — association not yet confirmed, it may still complete"
+        )),
+        JoinKind::Saved { fail_detail } => Event::JoinSavedFailed {
+            ssid,
+            reason: JoinFailReason::AssociationFailed,
+            detail: fail_detail,
+        },
+    }
+}
+
+/// Begin confirming a join. The first check runs inline, so a join that lands
+/// immediately still reports immediately and costs nothing extra.
+fn begin_verify(iface: &WifiInterface, events: &Emitter, ssid: String, kind: JoinKind) {
+    check_join(iface, events, ssid, kind, VERIFY_ATTEMPTS - 1);
+}
+
+/// One verification check.
+///
+/// `networksetup -setairportnetwork` exits 0 and prints a *localized* "Failed…"
+/// line on auth/password errors, so the only trustworthy signal is reading back
+/// the interface's current SSID via CoreWLAN. (The daemon holds the Location
+/// grant, so the readback isn't redacted here.) This used to poll in a
+/// `thread::sleep` loop for up to ten seconds — on the single CoreWLAN thread,
+/// so every scan behind it paid the full ten seconds too.
+fn check_join(
+    iface: &WifiInterface,
+    events: &Emitter,
+    ssid: String,
+    kind: JoinKind,
+    attempts_remaining: u8,
+) {
+    let joined = iface
+        .state()
+        .is_ok_and(|st| st.ssid.as_deref() == Some(ssid.as_str()));
+    match verify_step(joined, attempts_remaining) {
+        VerifyStep::Joined => {
+            if matches!(kind, JoinKind::Saved { .. }) {
+                dlog!("reconnected to {ssid}");
+            }
+            events.send(Event::Notice(format!("connected to {ssid}")));
+        }
+        VerifyStep::Retry { attempts_remaining } => {
+            events.schedule_verify(ssid, kind, attempts_remaining);
+            // Nothing is settled yet, so no state refresh: the caller gets one
+            // when the sequence resolves.
+            return;
+        }
+        VerifyStep::GiveUp => {
+            dlog!("join to {ssid}: association unconfirmed after {VERIFY_ATTEMPTS} checks");
+            events.send(verify_failure_event(ssid, kind));
+        }
+    }
+    emit_state(iface, events);
 }
 
 fn emit_preferred(iface: &WifiInterface, events: &Emitter) {
@@ -670,6 +801,73 @@ networks={networks} blank_ssids={blank} waiters={waiters} outcome={outcome}",
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verification_retries_exactly_the_configured_budget() {
+        // begin_verify runs the first check inline, so the scheduled retries
+        // are one fewer than the total attempts.
+        let mut attempts_remaining = VERIFY_ATTEMPTS - 1;
+        let mut checks = 1;
+        loop {
+            match verify_step(false, attempts_remaining) {
+                VerifyStep::Retry {
+                    attempts_remaining: n,
+                } => {
+                    attempts_remaining = n;
+                    checks += 1;
+                }
+                VerifyStep::GiveUp => break,
+                VerifyStep::Joined => unreachable!("never joined in this test"),
+            }
+            assert!(checks <= VERIFY_ATTEMPTS, "retry budget must terminate");
+        }
+        assert_eq!(checks, VERIFY_ATTEMPTS);
+        // The old blocking loop polled for the same ~10s window.
+        assert_eq!(
+            VERIFY_INTERVAL * u32::from(VERIFY_ATTEMPTS),
+            std::time::Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn a_confirmed_join_stops_checking_immediately() {
+        assert_eq!(verify_step(true, VERIFY_ATTEMPTS - 1), VerifyStep::Joined);
+        assert_eq!(verify_step(true, 0), VerifyStep::Joined);
+    }
+
+    #[test]
+    fn an_unconfirmed_password_join_is_only_a_notice() {
+        // networksetup accepted the password and the association may still
+        // land, so this must not look like a credential failure.
+        let ev = verify_failure_event("Cafe".into(), JoinKind::Password);
+        match ev {
+            Event::Notice(m) => assert!(m.contains("not yet confirmed"), "{m}"),
+            other => panic!("expected a notice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unconfirmed_saved_join_reports_association_failure() {
+        let ev = verify_failure_event(
+            "Cafe".into(),
+            JoinKind::Saved {
+                fail_detail: "cached password did not associate".into(),
+            },
+        );
+        match ev {
+            Event::JoinSavedFailed {
+                ssid,
+                reason,
+                detail,
+            } => {
+                assert_eq!(ssid, "Cafe");
+                // The client re-prompts for a password on this reason.
+                assert_eq!(reason, JoinFailReason::AssociationFailed);
+                assert_eq!(detail, "cached password did not associate");
+            }
+            other => panic!("expected JoinSavedFailed, got {other:?}"),
+        }
+    }
 
     #[test]
     fn startup_does_not_scan() {

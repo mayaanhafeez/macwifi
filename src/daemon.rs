@@ -24,7 +24,9 @@ use crate::corewlan::ScannedNetwork;
 use crate::event::Event;
 use crate::ipc::{self, ClientRequest, Hello, Reader, ServerEvent, Writer};
 use crate::scan::{self, ScanCoordinator, ScanDecision, ScanWaiter};
-use crate::worker::{LocalWifiHandle, Origin, Request, ScanTimings, WorkerCommand, WorkerEvent};
+use crate::worker::{
+    JoinKind, LocalWifiHandle, Origin, Request, ScanTimings, WorkerCommand, WorkerEvent,
+};
 
 /// Daemon-internal client identity, allocated once a connection has completed
 /// its handshake. Never crosses the wire — the client only ever sees the
@@ -179,6 +181,34 @@ operation={operation_id} — starting physical scan",
         );
     }
 
+    /// Wait out one verification interval, then hand the check back to the
+    /// CoreWLAN thread.
+    ///
+    /// The worker owns non-`Send` CoreWLAN handles, so the check itself has to
+    /// happen there — but the *waiting* does not, and doing it there blocked
+    /// every other request for up to ten seconds. A verification whose client
+    /// has since disconnected is still allowed to finish: abandoning it would
+    /// not undo the association, and `route` already drops the reply for a
+    /// client that is gone.
+    fn schedule_verify(
+        &self,
+        origin: Option<Origin>,
+        ssid: String,
+        kind: JoinKind,
+        attempts_remaining: u8,
+    ) {
+        let wifi = self.wifi.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(crate::worker::VERIFY_INTERVAL).await;
+            wifi.send_command(WorkerCommand::VerifyJoin {
+                origin,
+                ssid,
+                kind,
+                attempts_remaining,
+            });
+        });
+    }
+
     fn client_disconnected(&self, client_id: u64) {
         self.clients.lock().unwrap().remove(&client_id);
         self.coordinator.lock().unwrap().forget_client(client_id);
@@ -264,6 +294,12 @@ pub async fn run() -> Result<()> {
                     result,
                     timings,
                 } => hub_task.scan_finished(operation_id, result, timings),
+                WorkerEvent::ScheduleVerify {
+                    origin,
+                    ssid,
+                    kind,
+                    attempts_remaining,
+                } => hub_task.schedule_verify(origin, ssid, kind, attempts_remaining),
             }
         }
     });
@@ -641,7 +677,7 @@ mod socket_tests {
             .into_iter()
             .filter_map(|c| match c {
                 WorkerCommand::Scan { operation_id } => Some(operation_id),
-                WorkerCommand::Request { .. } => None,
+                WorkerCommand::Request { .. } | WorkerCommand::VerifyJoin { .. } => None,
             })
             .collect()
     }
@@ -803,5 +839,78 @@ mod socket_tests {
                 .expect("daemon closed the connection promptly")
                 .unwrap();
         assert!(next.is_none());
+    }
+}
+
+#[cfg(test)]
+mod verify_tests {
+    use super::*;
+    use crate::worker::{FakeWorker, JoinKind, VERIFY_INTERVAL};
+    use std::time::Duration;
+
+    fn hub() -> (Hub, FakeWorker) {
+        let (wifi, worker) = FakeWorker::spawn();
+        (
+            Hub {
+                clients: Arc::new(Mutex::new(HashMap::new())),
+                coordinator: Arc::new(Mutex::new(ScanCoordinator::default())),
+                wifi,
+            },
+            worker,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_verification_does_not_hold_the_worker() {
+        let (hub, worker) = hub();
+        hub.schedule_verify(None, "Cafe".into(), JoinKind::Password, 7);
+
+        // The wait happens on the runtime, not on the CoreWLAN thread: nothing
+        // is enqueued while it elapses, so a scan arriving now would be next.
+        tokio::time::sleep(VERIFY_INTERVAL / 2).await;
+        assert!(worker.try_next().is_none());
+
+        tokio::time::sleep(VERIFY_INTERVAL).await;
+        match worker.try_next() {
+            Some(WorkerCommand::VerifyJoin {
+                ssid,
+                attempts_remaining,
+                ..
+            }) => {
+                assert_eq!(ssid, "Cafe");
+                assert_eq!(attempts_remaining, 7);
+            }
+            other => panic!("expected a verification check, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_scan_during_verification_is_not_queued_behind_it() {
+        let (hub, worker) = hub();
+        hub.schedule_verify(
+            None,
+            "Cafe".into(),
+            JoinKind::Saved {
+                fail_detail: "cached password did not associate".into(),
+            },
+            19,
+        );
+
+        hub.scan_requested(ScanWaiter {
+            client_id: 1,
+            request_id: 1,
+        });
+        // The scan command is first in the queue despite the join being issued
+        // first — the ten-second verification window is no longer ahead of it.
+        assert!(matches!(
+            worker.try_next(),
+            Some(WorkerCommand::Scan { .. })
+        ));
+
+        tokio::time::sleep(VERIFY_INTERVAL + Duration::from_millis(1)).await;
+        assert!(matches!(
+            worker.try_next(),
+            Some(WorkerCommand::VerifyJoin { .. })
+        ));
     }
 }
