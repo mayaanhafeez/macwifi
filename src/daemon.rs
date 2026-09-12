@@ -23,7 +23,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use crate::corewlan::ScannedNetwork;
 use crate::event::Event;
 use crate::ipc::{self, ClientRequest, Hello, Reader, ServerEvent, Writer};
-use crate::scan::{self, ScanCoordinator, ScanDecision, ScanWaiter};
+use crate::scan::{self, ScanCoordinator, ScanDecision, ScanPurpose, ScanWaiter};
 use crate::worker::{
     JoinKind, LocalWifiHandle, Origin, Request, ScanTimings, WorkerCommand, WorkerEvent,
 };
@@ -101,17 +101,28 @@ impl Hub {
     /// Admit one `Request::Scan`, coalescing it with any scan already running
     /// and answering it from cache when a recent result is still good.
     fn scan_requested(&self, waiter: ScanWaiter) {
+        self.admit_scan(waiter, true);
+    }
+
+    /// `diagnose` needs scan counts to expose TCC redaction, but must share the
+    /// same physical scan and cache as ordinary scan requests.
+    fn diagnose_requested(&self, waiter: ScanWaiter) {
+        self.admit_scan(waiter, false);
+    }
+
+    fn admit_scan(&self, waiter: ScanWaiter, announce: bool) {
         let received = Instant::now();
         let origin = Self::origin(waiter);
         let decision = self.coordinator.lock().unwrap().request(waiter, received);
         // Every path emits `ScanStarted` first: it is what moves the TUI into
         // its scanning state, and on a cache hit the result follows in the
         // same breath.
-        self.route(origin, Event::ScanStarted);
+        if announce {
+            self.route(origin, Event::ScanStarted);
+        }
         match decision {
             ScanDecision::Cached(networks) => {
-                let diagnostic = scan::redaction_diagnostic(&networks);
-                self.deliver_scan(waiter, &networks, diagnostic.as_deref());
+                self.deliver_scan_response(waiter, &networks);
                 crate::dlog!(
                     "scan client={} request_id={} cache=hit coalesced=false total_ms={} \
 networks={} blank_ssids={} waiters=1 outcome=ok",
@@ -136,7 +147,46 @@ operation={operation_id} — starting physical scan",
                     waiter.client_id,
                     waiter.request_id,
                 );
-                self.wifi.send_command(WorkerCommand::Scan { operation_id });
+                if let Err(error) = self.wifi.send_command(WorkerCommand::Scan { operation_id }) {
+                    let completion =
+                        self.coordinator
+                            .lock()
+                            .unwrap()
+                            .abort(operation_id, error, Instant::now());
+                    if let Some(completion) = completion {
+                        for waiter in completion.waiters {
+                            self.route_scan_failure(
+                                waiter,
+                                match &completion.result {
+                                    Err(error) => error.clone(),
+                                    Ok(_) => unreachable!(),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn route_scan_failure(&self, waiter: ScanWaiter, error: String) {
+        self.route(Self::origin(waiter), Event::ScanFailed(error));
+    }
+
+    fn deliver_scan_response(&self, waiter: ScanWaiter, networks: &Arc<Vec<ScannedNetwork>>) {
+        match waiter.purpose {
+            ScanPurpose::Scan => {
+                let diagnostic = scan::redaction_diagnostic(networks);
+                self.deliver_scan(waiter, networks, diagnostic.as_deref());
+            }
+            ScanPurpose::Diagnose => {
+                if let Err(error) = self.wifi.send_command(WorkerCommand::Diagnose {
+                    origin: Self::origin(waiter),
+                    scan_count: networks.len(),
+                    scan_blank: scan::blank_ssids(networks),
+                }) {
+                    self.route_scan_failure(waiter, error);
+                }
             }
         }
     }
@@ -160,17 +210,14 @@ operation={operation_id} — starting physical scan",
         let waiters = completion.waiters.len();
         match &completion.result {
             Ok(networks) => {
-                // Computed once so every waiter on this sweep is told the same
-                // thing.
-                let diagnostic = scan::redaction_diagnostic(networks);
                 for waiter in &completion.waiters {
-                    self.deliver_scan(*waiter, networks, diagnostic.as_deref());
+                    self.deliver_scan_response(*waiter, networks);
                 }
                 crate::worker::log_scan(timings, Ok(networks), waiters);
             }
             Err(e) => {
                 for waiter in &completion.waiters {
-                    self.route(Self::origin(*waiter), Event::ScanFailed(e.clone()));
+                    self.route_scan_failure(*waiter, e.clone());
                 }
                 crate::worker::log_scan(timings, Err(e), waiters);
             }
@@ -200,7 +247,7 @@ operation={operation_id} — starting physical scan",
         let wifi = self.wifi.clone();
         tokio::spawn(async move {
             tokio::time::sleep(crate::worker::VERIFY_INTERVAL).await;
-            wifi.send_command(WorkerCommand::VerifyJoin {
+            let _ = wifi.send_command(WorkerCommand::VerifyJoin {
                 origin,
                 ssid,
                 kind,
@@ -377,20 +424,38 @@ async fn read_requests(reader: &mut Reader, hub: &Hub, client_id: u64) -> Result
         // Scans are admitted by the coordinator, which may answer from cache
         // or fold this request into a sweep already in progress. Everything
         // else goes straight to the CoreWLAN thread.
-        if matches!(request, Request::Scan) {
-            hub.scan_requested(ScanWaiter {
+        if matches!(request, Request::Scan | Request::Diagnose) {
+            let waiter = ScanWaiter {
                 client_id,
                 request_id: id,
-            });
+                purpose: if matches!(request, Request::Scan) {
+                    ScanPurpose::Scan
+                } else {
+                    ScanPurpose::Diagnose
+                },
+            };
+            if matches!(request, Request::Scan) {
+                hub.scan_requested(waiter);
+            } else {
+                hub.diagnose_requested(waiter);
+            }
             continue;
         }
-        hub.wifi.send_command(WorkerCommand::Request {
+        if let Err(error) = hub.wifi.send_command(WorkerCommand::Request {
             origin: Some(Origin {
                 client_id,
                 request_id: id,
             }),
             request,
-        });
+        }) {
+            hub.route(
+                Some(Origin {
+                    client_id,
+                    request_id: id,
+                }),
+                Event::Error(error),
+            );
+        }
     }
 }
 
@@ -677,7 +742,9 @@ mod socket_tests {
             .into_iter()
             .filter_map(|c| match c {
                 WorkerCommand::Scan { operation_id } => Some(operation_id),
-                WorkerCommand::Request { .. } | WorkerCommand::VerifyJoin { .. } => None,
+                WorkerCommand::Request { .. }
+                | WorkerCommand::Diagnose { .. }
+                | WorkerCommand::VerifyJoin { .. } => None,
             })
             .collect()
     }
@@ -737,6 +804,45 @@ mod socket_tests {
         assert!(
             scan_operations(&h.worker).is_empty(),
             "a cache hit must not reach the worker"
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnose_uses_the_scan_coordinator_without_a_second_sweep() {
+        let h = Harness::start();
+        let mut client = h.connect().await;
+
+        let id = client.send(Request::Diagnose).await;
+        let operation_id = loop {
+            match h.worker.try_next() {
+                Some(WorkerCommand::Scan { operation_id }) => break operation_id,
+                Some(other) => panic!("expected a coordinated scan, got {other:?}"),
+                None => tokio::task::yield_now().await,
+            }
+        };
+
+        h.hub
+            .scan_finished(operation_id, Ok(networks(2)), timings());
+        match h.worker.try_next() {
+            Some(WorkerCommand::Diagnose {
+                origin:
+                    Some(Origin {
+                        client_id,
+                        request_id,
+                    }),
+                scan_count,
+                scan_blank,
+            }) => {
+                assert_eq!(request_id, id);
+                assert_eq!(scan_count, 2);
+                assert_eq!(scan_blank, 0);
+                assert!(client_id > 0);
+            }
+            other => panic!("expected a diagnostic response, got {other:?}"),
+        }
+        assert!(
+            scan_operations(&h.worker).is_empty(),
+            "diagnose must not trigger a second physical scan"
         );
     }
 
@@ -899,6 +1005,7 @@ mod verify_tests {
         hub.scan_requested(ScanWaiter {
             client_id: 1,
             request_id: 1,
+            purpose: ScanPurpose::Scan,
         });
         // The scan command is first in the queue despite the join being issued
         // first — the ten-second verification window is no longer ahead of it.

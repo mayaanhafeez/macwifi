@@ -118,12 +118,15 @@ async fn supervise(
     reconnect: bool,
     next_id: Arc<AtomicU64>,
 ) {
+    let mut pending = None;
     loop {
         if auto_init {
             send_init(&mut conn.write_half, &next_id).await;
         }
-        let (rx, outcome) = run_connection(conn, req_rx, &events).await;
+        let (rx, outcome, failed_request) =
+            run_connection(conn, req_rx, pending.take(), &events).await;
         req_rx = rx;
+        pending = failed_request;
 
         match outcome {
             ConnOutcome::HandleDropped => return,
@@ -162,8 +165,13 @@ async fn supervise(
 async fn run_connection(
     conn: Conn,
     mut req_rx: UnboundedReceiver<ClientRequest>,
+    mut pending: Option<ClientRequest>,
     events: &UnboundedSender<ServerEvent>,
-) -> (UnboundedReceiver<ClientRequest>, ConnOutcome) {
+) -> (
+    UnboundedReceiver<ClientRequest>,
+    ConnOutcome,
+    Option<ClientRequest>,
+) {
     let Conn {
         mut reader,
         mut write_half,
@@ -186,10 +194,17 @@ async fn run_connection(
     });
 
     let outcome = loop {
+        if let Some(req) = pending.take()
+            && ipc::write_line(&mut write_half, &req).await.is_err()
+        {
+            pending = Some(req);
+            break ConnOutcome::Disconnected;
+        }
         tokio::select! {
             maybe_req = req_rx.recv() => match maybe_req {
                 Some(req) => {
                     if ipc::write_line(&mut write_half, &req).await.is_err() {
+                        pending = Some(req);
                         break ConnOutcome::Disconnected;
                     }
                 }
@@ -201,7 +216,7 @@ async fn run_connection(
 
     reader_handle.abort();
     let _ = write_half.shutdown().await;
-    (req_rx, outcome)
+    (req_rx, outcome, pending)
 }
 
 /// Ask the daemon for a fresh snapshot so the (re)connected TUI isn't blank or

@@ -97,6 +97,13 @@ pub enum WorkerCommand {
     /// operation id rather than an origin because one sweep may be answering
     /// any number of clients — the coordinator, not the worker, knows who.
     Scan { operation_id: u64 },
+    /// Collect daemon-only diagnostics after a coordinated scan. The counts
+    /// come from the shared result, so this must not start another sweep.
+    Diagnose {
+        origin: Option<Origin>,
+        scan_count: usize,
+        scan_blank: usize,
+    },
     /// One more check that a join took effect. Each is a single cheap state
     /// read; the waiting between them happens on the daemon's runtime.
     VerifyJoin {
@@ -220,15 +227,17 @@ impl LocalWifiHandle {
         Self { tx }
     }
 
-    pub fn send_command(&self, command: WorkerCommand) {
-        let _ = self.tx.send(Queued {
-            command,
-            enqueued: Instant::now(),
-        });
+    pub fn send_command(&self, command: WorkerCommand) -> Result<(), String> {
+        self.tx
+            .send(Queued {
+                command,
+                enqueued: Instant::now(),
+            })
+            .map_err(|_| "Wi-Fi worker is unavailable".to_string())
     }
 
     pub fn send(&self, req: Request) {
-        self.send_command(WorkerCommand::Request {
+        let _ = self.send_command(WorkerCommand::Request {
             origin: None,
             request: req,
         });
@@ -340,6 +349,17 @@ fn worker_loop(rx: std_mpsc::Receiver<Queued>, events: UnboundedSender<WorkerEve
                     result,
                     timings,
                 });
+            }
+            WorkerCommand::Diagnose {
+                origin,
+                scan_count,
+                scan_blank,
+            } => {
+                let emitter = Emitter {
+                    tx: events.clone(),
+                    origin,
+                };
+                emit_diagnose(&iface, &emitter, scan_count, scan_blank);
             }
         }
     }
@@ -491,19 +511,22 @@ fn dispatch(iface: &WifiInterface, events: &Emitter, req: Request, queue: Durati
             emit_preferred(iface, events);
         }
         Request::Diagnose => {
-            emit_diagnose(iface, events);
+            let scan = iface.scan().unwrap_or_default();
+            emit_diagnose(
+                iface,
+                events,
+                scan.len(),
+                scan.iter()
+                    .filter(|n| n.ssid.as_deref().is_none_or(str::is_empty))
+                    .count(),
+            );
         }
     }
 }
 
-fn emit_diagnose(iface: &WifiInterface, events: &Emitter) {
+fn emit_diagnose(iface: &WifiInterface, events: &Emitter, scan_count: usize, scan_blank: usize) {
     use crate::event::DaemonDiagnose;
     let state = iface.state();
-    let scan = iface.scan().unwrap_or_default();
-    let blank = scan
-        .iter()
-        .filter(|n| n.ssid.as_deref().is_none_or(str::is_empty))
-        .count();
     let location_auth_raw = unsafe {
         let mgr = objc2_core_location::CLLocationManager::new();
         mgr.authorizationStatus().0
@@ -520,8 +543,8 @@ fn emit_diagnose(iface: &WifiInterface, events: &Emitter) {
         location_auth_raw,
         interface,
         current_ssid,
-        scan_count: scan.len(),
-        scan_blank: blank,
+        scan_count,
+        scan_blank,
     }));
 }
 

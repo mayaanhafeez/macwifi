@@ -30,6 +30,14 @@ pub const CACHE_LIFETIME: Duration = Duration::from_secs(5);
 pub struct ScanWaiter {
     pub client_id: u64,
     pub request_id: u64,
+    pub purpose: ScanPurpose,
+}
+
+/// The response a request expects once the shared scan finishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanPurpose {
+    Scan,
+    Diagnose,
 }
 
 /// What the daemon should do about one incoming scan request.
@@ -153,6 +161,16 @@ impl ScanCoordinator {
     pub fn forget_client(&mut self, client_id: u64) {
         self.waiters.retain(|w| w.client_id != client_id);
     }
+
+    /// Abort the current operation when it could not be handed to the worker.
+    pub fn abort(
+        &mut self,
+        operation_id: u64,
+        error: String,
+        now: Instant,
+    ) -> Option<ScanCompletion> {
+        self.finish(operation_id, Err(error), now)
+    }
 }
 
 /// The diagnostic to send alongside a scan whose SSIDs all came back blank.
@@ -197,6 +215,7 @@ mod tests {
         ScanWaiter {
             client_id,
             request_id,
+            purpose: ScanPurpose::Scan,
         }
     }
 
@@ -237,6 +256,22 @@ mod tests {
         let completion = c.finish(1, Ok(vec![network(Some("net"))]), now).unwrap();
         assert_eq!(completion.waiters.len(), 10, "every request gets a reply");
         assert_eq!(c.next_operation_id, 2, "only one operation was started");
+    }
+
+    #[test]
+    fn aborted_operation_releases_waiters_and_allows_retry() {
+        let mut c = ScanCoordinator::default();
+        let now = Instant::now();
+        c.request(waiter(1, 1), now);
+        c.request(waiter(2, 2), now);
+
+        let completion = c.abort(1, "worker unavailable".into(), now).unwrap();
+        assert_eq!(completion.waiters.len(), 2);
+        assert!(matches!(completion.result, Err(ref e) if e == "worker unavailable"));
+        assert!(matches!(
+            c.request(waiter(3, 3), now),
+            ScanDecision::Start { operation_id: 2 }
+        ));
     }
 
     #[test]

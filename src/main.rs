@@ -305,8 +305,7 @@ async fn run_cli(cmd: Cmd) -> Result<()> {
         Cmd::Power { state } => {
             let on = matches!(state, PowerState::On);
             let evs = cli_one_shot(Request::SetPower(on), is_notice_or_error).await?;
-            print_terminal_event(&evs);
-            Ok(())
+            print_terminal_event(&evs)
         }
         Cmd::Connect { ssid, password } => {
             let req = match password {
@@ -314,8 +313,7 @@ async fn run_cli(cmd: Cmd) -> Result<()> {
                 None => Request::JoinSaved(ssid),
             };
             let evs = cli_one_shot(req, is_connect_terminal).await?;
-            print_terminal_event(&evs);
-            Ok(())
+            print_terminal_event(&evs)
         }
         Cmd::ConnectHidden { ssid, password } => {
             let req = Request::Associate(macwifi::worker::Associate {
@@ -323,8 +321,7 @@ async fn run_cli(cmd: Cmd) -> Result<()> {
                 kind: macwifi::worker::AssociateKind::Hidden(password),
             });
             let evs = cli_one_shot(req, is_notice_or_error).await?;
-            print_terminal_event(&evs);
-            Ok(())
+            print_terminal_event(&evs)
         }
         Cmd::ConnectPeap {
             ssid,
@@ -336,13 +333,11 @@ async fn run_cli(cmd: Cmd) -> Result<()> {
                 kind: macwifi::worker::AssociateKind::Peap { username, password },
             });
             let evs = cli_one_shot(req, is_notice_or_error).await?;
-            print_terminal_event(&evs);
-            Ok(())
+            print_terminal_event(&evs)
         }
         Cmd::Disconnect => {
             let evs = cli_one_shot(Request::Disconnect, is_notice_or_error).await?;
-            print_terminal_event(&evs);
-            Ok(())
+            print_terminal_event(&evs)
         }
         Cmd::Preferred => {
             let evs = cli_one_shot(Request::RefreshPreferred, |e| {
@@ -386,8 +381,7 @@ async fn run_cli(cmd: Cmd) -> Result<()> {
         }
         Cmd::Forget { ssid } => {
             let evs = cli_one_shot(Request::Forget(ssid), is_notice_or_error).await?;
-            print_terminal_event(&evs);
-            Ok(())
+            print_terminal_event(&evs)
         }
         Cmd::Themes | Cmd::InstallDaemon | Cmd::UninstallDaemon => unreachable!(),
         Cmd::Diagnose => run_diagnose().await,
@@ -402,16 +396,17 @@ fn is_connect_terminal(ev: &Event) -> bool {
     is_notice_or_error(ev) || matches!(ev, Event::JoinSavedFailed { .. })
 }
 
-fn print_terminal_event(evs: &[Event]) {
-    if let Some(ev) = evs.last() {
-        match ev {
-            Event::Notice(s) => println!("{s}"),
-            Event::Error(s) => eprintln!("error: {s}"),
-            Event::JoinSavedFailed { ssid, detail, .. } => {
-                eprintln!("error: connect to {ssid} failed: {detail}")
-            }
-            _ => {}
+fn print_terminal_event(evs: &[Event]) -> Result<()> {
+    match evs.last() {
+        Some(Event::Notice(message)) => {
+            println!("{message}");
+            Ok(())
         }
+        Some(Event::Error(message)) => Err(anyhow::anyhow!(message.clone())),
+        Some(Event::JoinSavedFailed { ssid, detail, .. }) => {
+            Err(anyhow::anyhow!("connect to {ssid} failed: {detail}"))
+        }
+        _ => Err(anyhow::anyhow!("daemon returned no terminal response")),
     }
 }
 
@@ -512,25 +507,35 @@ async fn run_diagnose() -> Result<()> {
     );
     println!();
     println!("== macwifi diagnose (daemon) ==");
-    match cli_one_shot(Request::Diagnose, |e| matches!(e, Event::DaemonDiagnose(_))).await {
+    match cli_one_shot(Request::Diagnose, |e| {
+        matches!(e, Event::DaemonDiagnose(_) | Event::ScanFailed(_))
+    })
+    .await
+    {
         Ok(evs) => {
             for ev in evs {
-                if let Event::DaemonDiagnose(d) = ev {
-                    println!("daemon pid        : {}", d.pid);
-                    println!("daemon parent pid : {}", d.parent_pid);
-                    println!(
-                        "daemon location   : {}  (0=notDet 1=restr 2=denied 3=always 4=whenInUse)",
-                        d.location_auth_raw
-                    );
-                    println!("interface         : {}", d.interface);
-                    println!(
-                        "current SSID      : {}",
-                        d.current_ssid.as_deref().unwrap_or("-")
-                    );
-                    println!(
-                        "scan              : {} networks, {} blank",
-                        d.scan_count, d.scan_blank
-                    );
+                match ev {
+                    Event::DaemonDiagnose(d) => {
+                        println!("daemon pid        : {}", d.pid);
+                        println!("daemon parent pid : {}", d.parent_pid);
+                        println!(
+                            "daemon location   : {}  (0=notDet 1=restr 2=denied 3=always 4=whenInUse)",
+                            d.location_auth_raw
+                        );
+                        println!("interface         : {}", d.interface);
+                        println!(
+                            "current SSID      : {}",
+                            d.current_ssid.as_deref().unwrap_or("-")
+                        );
+                        println!(
+                            "scan              : {} networks, {} blank",
+                            d.scan_count, d.scan_blank
+                        );
+                    }
+                    Event::ScanFailed(message) => {
+                        eprintln!("daemon section unavailable: {message}");
+                    }
+                    _ => {}
                 }
             }
         }

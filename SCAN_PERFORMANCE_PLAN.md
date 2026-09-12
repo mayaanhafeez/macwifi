@@ -436,6 +436,28 @@ Performance targets:
 
 Do not set a hard target for CoreWLAN's physical scan duration until the baseline separates it from application queue time.
 
+### Benchmark results (2026-08-30)
+
+Collected against the running bundled daemon with the release client. The
+daemon log contains the individual samples.
+
+| Scenario | Samples | Result |
+|---|---:|---|
+| Warm isolated scan (cache expired) | 50 | Queue and post-processing were 0 ms in every sample. Median CoreWLAN/worker total was 11,797 ms; p95 was 13,775 ms; maximum was 14,054 ms; no command failed. |
+| Fresh cache response | 50 | All 50 cache hits logged `total_ms=0`; no worker scan was started. |
+| Ten concurrent clients | 10 requests | One physical scan, `waiters=10`, with 0 ms worker queue time. |
+
+The 50 isolated samples also showed 24 rapid CoreWLAN responses (55-73 ms)
+whose results contained some blank SSIDs. The remaining 26 samples performed
+full 11.7-14.1 second sweeps with no blank SSIDs. This is CoreWLAN result
+behavior, not application queueing: `queue_ms` and `postprocess_ms` were zero
+in all samples. Follow up on partial SSID redaction separately from scan
+latency if it is visible to users.
+
+The sleep/wake, immediately-after-power-on, and deliberately failed-association
+scenarios remain manual acceptance checks because automating them would disrupt
+the active network connection.
+
 ## Rollout and Verification
 
 Implement and verify each phase separately. After every phase:
