@@ -28,6 +28,11 @@ pub enum Event {
     State(InterfaceState),
     ScanStarted,
     ScanResult(Vec<ScannedNetwork>),
+    /// A scan that will not produce a result. Distinct from `Error` because
+    /// only this clears the client's scanning indicator — inferring it from a
+    /// generic error means any unrelated error stops the spinner, and any
+    /// scan failure that does not look like one leaves it spinning forever.
+    ScanFailed(String),
     PreferredResult(Vec<String>),
     Notice(String),
     Error(String),
@@ -111,9 +116,8 @@ impl UiEventHandler {
                         CtEvent::Key(k) if k.kind == crossterm::event::KeyEventKind::Press => {
                             if tx.send(UiEvent::Key(k)).is_err() { break; }
                         }
-                        CtEvent::Resize(w, h) => {
-                            if tx.send(UiEvent::Resize(w, h)).is_err() { break; }
-                        }
+                        CtEvent::Resize(w, h)
+                            if tx.send(UiEvent::Resize(w, h)).is_err() => { break; }
                         _ => {}
                     }
                 }

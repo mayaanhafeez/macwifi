@@ -74,6 +74,12 @@ objc2-core-foundation = { version = "0.3", features = ["CFRunLoop"] }
 # persists across runs) rather than to the system `security` binary.
 security-framework = "3"
 
+# `test-util` powers tokio's paused clock, so the join-verification tests can
+# step through the 500 ms retry interval without actually waiting. Kept out of
+# the normal dependency so it can never reach a release build.
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
 [profile.release]
 strip = true
 lto = "fat"

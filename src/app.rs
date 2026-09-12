@@ -87,6 +87,21 @@ impl App {
         }
     }
 
+    /// Ask for a scan, unless one is already outstanding.
+    ///
+    /// Holding `s` down used to enqueue a request per keypress. The daemon now
+    /// coalesces those, but the TUI should not be generating them in the first
+    /// place: the spinner is already up and the extra requests answer nothing.
+    /// The flag is set here rather than waiting for `ScanStarted` so a key
+    /// repeat can't slip several requests through the round trip.
+    pub fn request_scan(&mut self) {
+        if self.scanning {
+            return;
+        }
+        self.scanning = true;
+        self.wifi.send(Request::Scan);
+    }
+
     pub fn quit(&mut self) {
         self.running = false;
     }
@@ -127,7 +142,7 @@ impl App {
         let len = self.visible_preferred().len();
         if len == 0 {
             self.preferred_state.select(None);
-        } else if self.preferred_state.selected().map_or(true, |i| i >= len) {
+        } else if self.preferred_state.selected().is_none_or(|i| i >= len) {
             self.preferred_state.select(Some(0));
         }
     }
@@ -180,7 +195,8 @@ impl App {
     }
 
     pub fn visible_networks(&self) -> Vec<&ScannedNetwork> {
-        let mut out = self.networks
+        let mut out = self
+            .networks
             .iter()
             .filter(|n| {
                 // impala parity: a scanned network we already have a saved
@@ -189,18 +205,17 @@ impl App {
                 let known = n
                     .ssid
                     .as_deref()
-                    .map_or(false, |s| self.preferred.iter().any(|p| p == s));
+                    .is_some_and(|s| self.preferred.iter().any(|p| p == s));
                 if known {
                     return false;
                 }
                 // `show_all` additionally reveals weak-signal and
                 // hidden/redacted networks that are otherwise filtered out.
-                self.show_all
-                    || (n.ssid.as_deref().map_or(false, |s| !s.is_empty()) && n.rssi > -85)
+                self.show_all || (n.ssid.as_deref().is_some_and(|s| !s.is_empty()) && n.rssi > -85)
             })
             .collect::<Vec<_>>();
         // Sort strongest signal first (RSSI is negative; higher = stronger).
-        out.sort_by(|a, b| b.rssi.cmp(&a.rssi));
+        out.sort_by_key(|n| -n.rssi);
         out
     }
 
@@ -208,6 +223,10 @@ impl App {
         match ev {
             Event::State(s) => self.state = Some(s),
             Event::ScanStarted => self.scanning = true,
+            Event::ScanFailed(s) => {
+                self.scanning = false;
+                self.notifications.push(Notification::error(s));
+            }
             Event::ScanResult(n) => {
                 self.networks = n;
                 self.scanning = false;
@@ -215,7 +234,7 @@ impl App {
                 let len = self.visible_networks().len();
                 if len == 0 {
                     self.available_state.select(None);
-                } else if self.available_state.selected().map_or(true, |i| i >= len) {
+                } else if self.available_state.selected().is_none_or(|i| i >= len) {
                     self.available_state.select(Some(0));
                 }
                 // The Known Networks list is filtered by what's in range, so it
@@ -223,7 +242,7 @@ impl App {
                 let plen = self.visible_preferred().len();
                 if plen == 0 {
                     self.preferred_state.select(None);
-                } else if self.preferred_state.selected().map_or(true, |i| i >= plen) {
+                } else if self.preferred_state.selected().is_none_or(|i| i >= plen) {
                     self.preferred_state.select(Some(0));
                 }
             }
@@ -233,14 +252,18 @@ impl App {
                 let len = self.visible_preferred().len();
                 if len == 0 {
                     self.preferred_state.select(None);
-                } else if self.preferred_state.selected().map_or(true, |i| i >= len) {
+                } else if self.preferred_state.selected().is_none_or(|i| i >= len) {
                     self.preferred_state.select(Some(0));
                 }
             }
             Event::Notice(s) => self.notifications.push(Notification::info(s)),
             Event::Error(s) => self.notifications.push(Notification::error(s)),
             Event::ShareReady(p) => self.overlay = Overlay::Share(p),
-            Event::JoinSavedFailed { ssid, reason, detail } => {
+            Event::JoinSavedFailed {
+                ssid,
+                reason,
+                detail,
+            } => {
                 match reason {
                     // Out of range isn't a credential problem — a password
                     // prompt would be misleading. Just say so.
@@ -389,9 +412,9 @@ impl App {
         {
             Some(Security::Open) => Some(ShareSecurity::Nopass),
             Some(Security::Wep) => Some(ShareSecurity::Wep),
-            Some(
-                Security::WpaEnterprise | Security::Wpa2Enterprise | Security::Wpa3Enterprise,
-            ) => None,
+            Some(Security::WpaEnterprise | Security::Wpa2Enterprise | Security::Wpa3Enterprise) => {
+                None
+            }
             _ => Some(ShareSecurity::Wpa),
         }
     }
@@ -451,5 +474,81 @@ impl App {
             }
             Overlay::Info | Overlay::Share(_) | Overlay::None => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::FakeWorker;
+
+    fn app() -> (App, FakeWorker) {
+        let (wifi, worker) = FakeWorker::spawn();
+        let mut app = App::new(WifiHandle::Local(wifi), None);
+        // Startup begins in the scanning state; these tests start from rest.
+        app.scanning = false;
+        (app, worker)
+    }
+
+    #[test]
+    fn repeated_scan_keypresses_do_not_enqueue_work() {
+        let (mut app, worker) = app();
+
+        app.request_scan();
+        assert_eq!(worker.commands().len(), 1);
+
+        for _ in 0..5 {
+            app.request_scan();
+        }
+        assert!(
+            worker.commands().is_empty(),
+            "a scan is already outstanding"
+        );
+    }
+
+    #[test]
+    fn scan_failure_stops_the_spinner() {
+        let (mut app, _worker) = app();
+        app.scanning = true;
+
+        app.handle_event(Event::ScanFailed("scan failed: radio off".into()));
+
+        assert!(!app.scanning);
+        assert_eq!(app.notifications.len(), 1);
+    }
+
+    #[test]
+    fn a_failed_scan_lets_the_next_one_through() {
+        let (mut app, worker) = app();
+        app.request_scan();
+        let _ = worker.commands();
+
+        app.handle_event(Event::ScanFailed("scan failed".into()));
+        app.request_scan();
+
+        assert_eq!(worker.commands().len(), 1);
+    }
+
+    #[test]
+    fn an_unrelated_error_leaves_the_spinner_alone() {
+        let (mut app, _worker) = app();
+        app.scanning = true;
+
+        // Only a scan-specific failure clears the indicator; inferring it from
+        // any error would stop the spinner on, say, a keychain complaint that
+        // arrived while the scan was still running.
+        app.handle_event(Event::Error("keychain: item not found".into()));
+
+        assert!(app.scanning);
+    }
+
+    #[test]
+    fn a_scan_result_stops_the_spinner() {
+        let (mut app, _worker) = app();
+        app.scanning = true;
+
+        app.handle_event(Event::ScanResult(Vec::new()));
+
+        assert!(!app.scanning);
     }
 }

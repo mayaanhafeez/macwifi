@@ -10,6 +10,7 @@ Station mode only. Theming, hidden networks, QR sharing, adapter info, and a
 ## Features
 
 - Live scan & associate (open / WPA-PSK / WPA-Enterprise PEAP/MSCHAPv2 / hidden)
+- **Coalesced scans**: simultaneous scan requests share one physical sweep, and a result under 5s old is served from daemon memory — so a TUI reconnect, a keypress, and a couple of CLI one-shots cost one scan, not four (see [Scan performance](#scan-performance))
 - Both network lists sorted by signal strength (strongest first); out-of-range saved networks sink to the bottom
 - Manage saved networks (list, remove) and the current connection (disconnect, toggle power)
 - **Silent reconnect**: the password you type on first connect is cached in macwifi's own login-keychain item, so reconnecting to a saved network is promptless (see [Passwords & prompts](#passwords--prompts))
@@ -258,7 +259,7 @@ while security delete-generic-password -s macwifi-wifi >/dev/null 2>&1; do :; do
 | `Tab` | Toggle focus between Known Networks / New Networks lists |
 | `j` / `k` / `↓` / `↑` | Move selection |
 | `Enter` | Connect (password / enterprise overlays appear as needed) |
-| `s` | Rescan |
+| `s` | Rescan (ignored while a scan is already running) |
 | `o` | Toggle radio power on/off |
 | `d` | Remove the selected saved network (Known Networks) |
 | `x` | Disconnect |
@@ -531,8 +532,60 @@ helper" design was abandoned — is in `ARCHITECTURE_PASSWORDS.md`.
   Location TCC grants to apply.
 - **TUI client** (`macwifi` with no subcommand): connects to the daemon socket,
   receives scan/state events, and sends commands.
+- **Scan coordinator**: the daemon admits every `Scan` request through a
+  single-flight coordinator. Concurrent requests join one physical sweep, and a
+  successful result stays servable from memory for 5 seconds. The cache is
+  memory-only — a scan result that survived a daemon restart would describe a
+  different place entirely.
+- **Request correlation**: each request carries an id (`ClientRequest`) and each
+  reply carries the id it answers (`ServerEvent`). Interface state and the
+  preferred-network list still reach every client, so a second TUI never goes
+  stale; command replies go only to the client that asked. This is what lets one
+  sweep answer several clients without their results crossing.
 - **Socket path**: `~/Library/Application Support/macwifi/daemon.sock`
-- **Daemon logs**: `/tmp/macwifi-daemon.out.log` and `/tmp/macwifi-daemon.err.log`
+- **Daemon log**: `~/Library/Application Support/macwifi/daemon.log` — per-scan
+  timings and join diagnostics (see [Scan performance](#scan-performance))
+- **launchd logs**: `/tmp/macwifi-daemon.out.log` and `/tmp/macwifi-daemon.err.log`
+
+---
+
+## Scan performance
+
+A Wi-Fi scan on macOS is slow, and most of that is not macwifi's to fix.
+`CWInterface::scanForNetworksWithName:` is synchronous and CoreWLAN owns the
+channel traversal; a full sweep routinely takes **10–15 seconds** on a busy
+band. What macwifi controls is how many of those sweeps it asks for.
+
+Every scan is logged to `~/Library/Application Support/macwifi/daemon.log`
+with its time split at the boundaries that matter:
+
+```
+scan queue_ms=0 corewlan_ms=13413 postprocess_ms=0 worker_total_ms=13413 \
+networks=63 blank_ssids=0 waiters=1 outcome=ok
+```
+
+- `queue_ms` — time spent waiting behind another worker operation. Should be ~0;
+  anything large means something is monopolising the CoreWLAN thread.
+- `corewlan_ms` — the physical sweep. Not cancellable and not tunable.
+- `postprocess_ms` — sorting and conversion on our side. Effectively 0.
+- `blank_ssids` — a full row of blanks means the Location grant was lost; see
+  [Troubleshooting](#troubleshooting).
+
+Request lines say how each scan was admitted:
+
+```
+scan client=4 request_id=1 cache=miss coalesced=false operation=3 — starting physical scan
+scan client=5 request_id=1 cache=miss coalesced=true — joined running scan
+scan client=9 request_id=1 cache=hit coalesced=false total_ms=0 networks=55 ...
+```
+
+So five concurrent `macwifi scan` calls cost one sweep rather than five, and a
+scan issued within the cache window returns in milliseconds instead of seconds.
+
+Join verification is also off the critical path: confirming a join polls for up
+to 10 seconds, but the waiting happens on the daemon's runtime rather than on
+the CoreWLAN thread, so a scan issued during a slow join no longer queues
+behind it.
 
 ---
 
@@ -562,6 +615,29 @@ If not, check the logs and reinstall:
 ```sh
 cat /tmp/macwifi-daemon.err.log
 macwifi uninstall-daemon && macwifi install-daemon
+```
+
+**Scans take 10–15 seconds**
+
+Usually normal, and usually not macwifi. Check the daemon log:
+
+```sh
+grep '^\[.*\] scan ' ~/Library/Application\ Support/macwifi/daemon.log | tail
+```
+
+If `corewlan_ms` accounts for nearly all of `worker_total_ms`, the time is
+inside CoreWLAN's channel sweep and there is nothing to tune — repeat scans
+within 5 seconds are served from cache instead. If `queue_ms` is large, some
+other operation is holding the CoreWLAN thread; that's a bug worth reporting
+with the surrounding log lines.
+
+**"protocol version mismatch — the daemon is a stale build"**
+
+The client and the running daemon disagree on the wire format, which happens
+after an upgrade that changed the protocol if the daemon wasn't restarted:
+
+```sh
+CODESIGN_IDENTITY=macwifi-dev ./scripts/reinstall.sh
 ```
 
 **Asked for the password every time you reconnect to a saved network**

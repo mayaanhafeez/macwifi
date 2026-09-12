@@ -19,17 +19,17 @@ fn handle_global(app: &mut App, key: KeyEvent) {
         (KeyCode::Tab, _) => app.toggle_focus(),
         (KeyCode::Char('j'), _) | (KeyCode::Down, _) => app.move_selection(1),
         (KeyCode::Char('k'), _) | (KeyCode::Up, _) => app.move_selection(-1),
-        (KeyCode::Char('s'), _) => app.wifi.send(Request::Scan),
+        (KeyCode::Char('s'), _) => app.request_scan(),
         (KeyCode::Char('o'), _) => {
             let target = app.state.as_ref().map(|s| !s.powered).unwrap_or(true);
             app.wifi.send(Request::SetPower(target));
         }
         (KeyCode::Char('x'), _) => app.wifi.send(Request::Disconnect),
         (KeyCode::Char('d'), _) => {
-            if app.focus == Focus::Preferred {
-                if let Some(ssid) = app.selected_preferred() {
-                    app.wifi.send(Request::Forget(ssid));
-                }
+            if app.focus == Focus::Preferred
+                && let Some(ssid) = app.selected_preferred()
+            {
+                app.wifi.send(Request::Forget(ssid));
             }
         }
         (KeyCode::Char('p'), _) => app.share_selected_preferred(),

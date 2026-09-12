@@ -55,12 +55,12 @@ pub fn line(msg: &str) {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    if let Some(lock) = LOG.get() {
-        if let Ok(mut f) = lock.lock() {
-            let _ = writeln!(f, "[{secs}] {msg}");
-            let _ = f.flush();
-            return;
-        }
+    if let Some(lock) = LOG.get()
+        && let Ok(mut f) = lock.lock()
+    {
+        let _ = writeln!(f, "[{secs}] {msg}");
+        let _ = f.flush();
+        return;
     }
     eprintln!("[{secs}] {msg}");
 }

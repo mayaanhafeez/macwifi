@@ -57,7 +57,11 @@ pub fn set_airport_network(iface: &str, ssid: &str, password: Option<&str>) -> R
     Ok(())
 }
 
-fn airport_network_args<'a>(iface: &'a str, ssid: &'a str, password: Option<&'a str>) -> Vec<&'a str> {
+fn airport_network_args<'a>(
+    iface: &'a str,
+    ssid: &'a str,
+    password: Option<&'a str>,
+) -> Vec<&'a str> {
     let mut args = vec!["-setairportnetwork", iface, ssid];
     if let Some(password) = password.filter(|password| !password.is_empty()) {
         args.push(password);

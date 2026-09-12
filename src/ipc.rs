@@ -2,7 +2,12 @@
 //!
 //! Newline-delimited JSON over a per-user unix socket. Each side sends a
 //! `Hello` line first to confirm protocol version. Subsequent lines are
-//! `Request` (client → daemon) or `Event` (daemon → client).
+//! `ClientRequest` (client → daemon) or `ServerEvent` (daemon → client).
+//!
+//! Both directions are wrapped in a correlation envelope rather than adding an
+//! id to every `Request`/`Event` variant. With several clients on one daemon —
+//! a TUI plus any number of CLI one-shots — an uncorrelated reply stream means
+//! one client's scan result can satisfy another client's request.
 
 use std::path::PathBuf;
 
@@ -11,7 +16,36 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+use crate::event::Event;
+use crate::worker::Request;
+
+pub const PROTOCOL_VERSION: u32 = 3;
+
+/// A request plus the id the client will match its reply against. Ids are
+/// per-connection and monotonic; the daemon never interprets them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientRequest {
+    pub id: u64,
+    pub request: Request,
+}
+
+/// An event plus the request it answers. `None` means unsolicited: a global
+/// state change caused by someone else, or a daemon-wide notice.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerEvent {
+    pub request_id: Option<u64>,
+    pub event: Event,
+}
+
+impl ServerEvent {
+    /// An event no client asked for.
+    pub fn unsolicited(event: Event) -> Self {
+        Self {
+            request_id: None,
+            event,
+        }
+    }
+}
 
 /// Build identifier baked in at compile time (see `build.rs`): short git hash +
 /// build timestamp. Compared across the handshake so a stale daemon left running
@@ -35,10 +69,7 @@ pub fn socket_path() -> PathBuf {
     base.join("macwifi").join("daemon.sock")
 }
 
-pub async fn write_line<W: AsyncWriteExt + Unpin, T: Serialize>(
-    w: &mut W,
-    v: &T,
-) -> Result<()> {
+pub async fn write_line<W: AsyncWriteExt + Unpin, T: Serialize>(w: &mut W, v: &T) -> Result<()> {
     let mut buf = serde_json::to_vec(v).context("serialize ipc message")?;
     buf.push(b'\n');
     w.write_all(&buf).await.context("socket write")?;

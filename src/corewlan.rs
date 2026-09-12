@@ -83,7 +83,11 @@ impl WifiInterface {
                 .map(ns_string)
                 .or_else(|| self.iface.ssidData().and_then(ns_data_to_string));
             Ok(InterfaceState {
-                name: self.iface.interfaceName().map(ns_string).unwrap_or_default(),
+                name: self
+                    .iface
+                    .interfaceName()
+                    .map(ns_string)
+                    .unwrap_or_default(),
                 powered: self.iface.powerOn(),
                 hw_address: self.iface.hardwareAddress().map(ns_string),
                 ssid,
@@ -91,10 +95,7 @@ impl WifiInterface {
                 rssi: self.iface.rssiValue(),
                 noise: self.iface.noiseMeasurement(),
                 tx_rate: self.iface.transmitRate(),
-                channel: self
-                    .iface
-                    .wlanChannel()
-                    .map(|c| c.channelNumber() as u32),
+                channel: self.iface.wlanChannel().map(|c| c.channelNumber() as u32),
             })
         }
     }
