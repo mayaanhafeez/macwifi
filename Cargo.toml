@@ -1,6 +1,6 @@
 [package]
 name = "macwifi"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "macOS port of impala — TUI for managing Wi-Fi"
 license = "GPL-3.0"
